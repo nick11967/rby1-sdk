@@ -47,6 +47,81 @@ def camera_sidecar_path(robot_recording: Path) -> Path:
     return robot_recording.with_suffix(".cameras.h5")
 
 
+import struct
+
+TELEOP_SHM_PATH = Path("/dev/shm/rby1_teleop_state")
+TELEOP_STRUCT_FMT = "=4sQ2d3d14d"
+TELEOP_STRUCT_SIZE = struct.calcsize(TELEOP_STRUCT_FMT)
+
+
+class TeleopStatePublisher:
+    """Publish 100 Hz leader arm triggers, base velocity, and leader joints to /dev/shm."""
+
+    def __init__(self, path: Path = TELEOP_SHM_PATH):
+        self.path = path
+
+    def publish(
+        self,
+        gripper_command: np.ndarray,
+        base_command: np.ndarray,
+        leader_q: np.ndarray,
+    ) -> None:
+        try:
+            r_g = float(gripper_command[0]) if len(gripper_command) > 0 else 0.0
+            l_g = float(gripper_command[1]) if len(gripper_command) > 1 else 0.0
+            vx = float(base_command[0]) if len(base_command) > 0 else 0.0
+            vy = float(base_command[1]) if len(base_command) > 1 else 0.0
+            wz = float(base_command[2]) if len(base_command) > 2 else 0.0
+            lq = [float(v) for v in leader_q[:14]] if len(leader_q) >= 14 else [0.0] * 14
+
+            data = struct.pack(
+                TELEOP_STRUCT_FMT,
+                b"RBY1",
+                time.monotonic_ns(),
+                r_g,
+                l_g,
+                vx,
+                vy,
+                wz,
+                *lq,
+            )
+            with open(self.path, "wb") as f:
+                f.write(data)
+        except Exception:
+            pass
+
+
+class TeleopStateSubscriber:
+    """Subscribe to 100 Hz teleoperation state from /dev/shm."""
+
+    def __init__(self, path: Path = TELEOP_SHM_PATH):
+        self.path = path
+
+    def read(self, max_age_s: float = 0.5) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        try:
+            if self.path.exists():
+                with open(self.path, "rb") as f:
+                    data = f.read(TELEOP_STRUCT_SIZE)
+                if len(data) == TELEOP_STRUCT_SIZE:
+                    unpacked = struct.unpack(TELEOP_STRUCT_FMT, data)
+                    magic, ts_ns, r_g, l_g, vx, vy, wz = unpacked[:7]
+                    lq = unpacked[7:]
+                    now_ns = time.monotonic_ns()
+                    if magic == b"RBY1" and (now_ns - ts_ns) < int(max_age_s * 1e9):
+                        return (
+                            np.array([r_g, l_g], dtype=np.float64),
+                            np.array([vx, vy, wz], dtype=np.float64),
+                            np.array(lq, dtype=np.float64),
+                        )
+        except Exception:
+            pass
+        return (
+            np.zeros(2, dtype=np.float64),
+            np.zeros(3, dtype=np.float64),
+            np.zeros(14, dtype=np.float64),
+        )
+
+
 def _load_camera_readers(camera_stack_root: Path):
     root = camera_stack_root.expanduser().resolve()
     if not (root / "camera_stack").is_dir():

@@ -39,6 +39,7 @@ from camera_io import (
     ZED_RECORD_PROFILES,
     ZED_SHM_MODES,
     camera_sidecar_path,
+    TeleopStateSubscriber,
 )
 
 
@@ -140,6 +141,7 @@ class EpisodeBuffer:
         self.started_monotonic_ns = 0
         self.started_unix_ns = 0
         self.is_recording = False
+        self.teleop_sub = TeleopStateSubscriber()
         self._lock = threading.Lock()
 
         self.time_s: List[float] = []
@@ -153,6 +155,9 @@ class EpisodeBuffer:
         self.target_velocity: List[np.ndarray] = []
         self.odometry: List[np.ndarray] = []
         self.odometry_pose: List[np.ndarray] = []
+        self.gripper_command: List[np.ndarray] = []
+        self.base_command: List[np.ndarray] = []
+        self.leader_position: List[np.ndarray] = []
 
     def start(self) -> None:
         with self._lock:
@@ -169,6 +174,9 @@ class EpisodeBuffer:
             self.target_velocity.clear()
             self.odometry.clear()
             self.odometry_pose.clear()
+            self.gripper_command.clear()
+            self.base_command.clear()
+            self.leader_position.clear()
             self.is_recording = True
 
     def append_sample(self, state: rby.RobotState) -> None:
@@ -196,6 +204,12 @@ class EpisodeBuffer:
             y = odom_mat[1, 2]
             theta = np.arctan2(odom_mat[1, 0], odom_mat[0, 0])
             self.odometry_pose.append(np.array([x, y, theta], dtype=np.float64))
+
+            # Read live gripper triggers, mobile base command, and leader arm joint angles from SHM
+            grip_cmd, base_cmd, leader_q = self.teleop_sub.read()
+            self.gripper_command.append(grip_cmd.copy())
+            self.base_command.append(base_cmd.copy())
+            self.leader_position.append(leader_q.copy())
 
     def sample_count(self) -> int:
         with self._lock:
@@ -234,6 +248,9 @@ class EpisodeBuffer:
                 target_velocity=np.asarray(self.target_velocity, dtype=np.float64),
                 odometry=np.asarray(self.odometry, dtype=np.float64),
                 odometry_pose=np.asarray(self.odometry_pose, dtype=np.float64),
+                gripper_command=np.asarray(self.gripper_command, dtype=np.float64),
+                base_command=np.asarray(self.base_command, dtype=np.float64),
+                leader_position=np.asarray(self.leader_position, dtype=np.float64),
             )
             return count
 
@@ -251,6 +268,9 @@ class EpisodeBuffer:
             self.target_velocity.clear()
             self.odometry.clear()
             self.odometry_pose.clear()
+            self.gripper_command.clear()
+            self.base_command.clear()
+            self.leader_position.clear()
 
 
 def create_parser() -> argparse.ArgumentParser:

@@ -33,6 +33,7 @@ from camera_io import (
     ZED_RECORD_PROFILES,
     ZED_SHM_MODES,
     camera_sidecar_path,
+    TeleopStatePublisher,
 )
 
 EXAMPLES_DIR = Path(__file__).resolve().parent.parent
@@ -597,6 +598,8 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
             )
         )
 
+        teleop_publisher = TeleopStatePublisher()
+
         def leader_arm_control_loop(state):
             nonlocal right_q, left_q
             nonlocal right_minimum_time, left_minimum_time
@@ -761,6 +764,7 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
                 left_minimum_time = 0.8
 
             base_command = keyboard.get_command()
+            teleop_publisher.publish(gripper_command, base_command, state.q_joint)
             if has_body_command:
                 arm_stream.send_command(
                     rby.RobotCommandBuilder().set_command(
