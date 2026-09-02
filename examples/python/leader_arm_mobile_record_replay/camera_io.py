@@ -227,10 +227,13 @@ class CameraHdf5Writer:
             ) from exc
 
         if path.exists():
-            raise FileExistsError(f"camera output already exists: {path}")
+            try:
+                path.unlink()
+            except Exception:
+                pass
         path.parent.mkdir(parents=True, exist_ok=True)
         self.path = path
-        self._h5 = h5py.File(path, "x")
+        self._h5 = h5py.File(path, "w")
         self._count = 0
         self._capacity = 0
         self._capacity_block = capacity_block
