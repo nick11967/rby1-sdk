@@ -51,9 +51,9 @@ from gripper_command_client import GripperCommandClient
 
 
 # Self-contained LeaderArm Autohome & Utility Functions
-HOMING_PID_P = 2800
-HOMING_PID_I = 300
-HOMING_PID_D = 4000
+HOMING_PID_P = 2200
+HOMING_PID_I = 50
+HOMING_PID_D = 800
 NUM_LEADER_MOTORS = 14
 
 
@@ -77,24 +77,29 @@ def read_joint_positions(bus: rby.DynamixelBus, motor_ids: list[int] = list(rang
 def auto_home_leader_arm(
     leader_arm: LeaderArm,
     target_pose: np.ndarray,
-    duration: float = 4.0,
+    duration: float = 6.0,
     tolerance: float = 0.05,
+    current_scale: float = 1.0,
 ) -> Tuple[bool, np.ndarray, np.ndarray]:
     """Smoothly auto-home LeaderArm to target joint angles."""
     bus = leader_arm.bus
     motor_ids = list(range(NUM_LEADER_MOTORS))
-    homing_torque_limits = [3.5, 3.5, 3.5, 1.5, 1.5, 1.5, 1.5] * 2
 
     for dev_id in motor_ids:
         bus.set_position_pid_gain(dev_id, p_gain=HOMING_PID_P, i_gain=HOMING_PID_I, d_gain=HOMING_PID_D)
 
+    # Base torque limits (Nm): [shoulder roll, shoulder pitch, shoulder yaw, elbow pitch, wrist roll, wrist pitch, wrist yaw]
+    # Elbow (joint 3) is boosted to 3.5 Nm to overcome gravity when lifting the forearm and wrist
+    base_torque_limits = np.array([4.5, 4.5, 4.5, 3.5, 2.0, 2.0, 2.0] * 2, dtype=np.float64)
+    homing_torque_limits = np.clip(base_torque_limits * current_scale, 0.5, 6.0)
+
     bus.group_sync_write_torque_enable(motor_ids, 0)
     bus.group_sync_write_operating_mode([(i, rby.DynamixelBus.CurrentBasedPositionControlMode) for i in motor_ids])
     bus.group_sync_write_torque_enable(motor_ids, 1)
-    bus.group_sync_write_send_torque([(i, homing_torque_limits[i]) for i in motor_ids])
 
     q_start = read_joint_positions(bus, motor_ids)
     start_time = time.monotonic()
+    torque_cmd = [(i, float(homing_torque_limits[i])) for i in motor_ids]
 
     while True:
         elapsed = time.monotonic() - start_time
@@ -102,14 +107,25 @@ def auto_home_leader_arm(
             break
         s = s_curve_quintic(elapsed, duration)
         q_des = q_start + s * (target_pose - q_start)
-        bus.group_sync_write_send_position([(i, q_des[i]) for i in motor_ids])
+        pos_cmd = [(i, float(q_des[i])) for i in motor_ids]
+        bus.group_sync_write_send_torque(torque_cmd)
+        bus.group_sync_write_send_position(pos_cmd)
         time.sleep(0.01)
 
-    bus.group_sync_write_send_position([(i, target_pose[i]) for i in motor_ids])
-    time.sleep(0.15)
-
+    # Target pose hold & settling loop (up to 1.5s for convergence)
+    final_pos_cmd = [(i, float(target_pose[i])) for i in motor_ids]
+    settle_start = time.monotonic()
     q_final = read_joint_positions(bus, motor_ids)
     errors = np.abs(q_final - target_pose)
+    while time.monotonic() - settle_start < 1.5:
+        if np.all(errors < tolerance):
+            break
+        bus.group_sync_write_send_torque(torque_cmd)
+        bus.group_sync_write_send_position(final_pos_cmd)
+        time.sleep(0.05)
+        q_final = read_joint_positions(bus, motor_ids)
+        errors = np.abs(q_final - target_pose)
+
     success = bool(np.all(errors < tolerance))
     return success, q_final, errors
 
@@ -507,15 +523,37 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
         # 6. LeaderArm Auto-Homing to Robot's Current Pose
         if not args.skip_autohome:
             logging.info("=" * 60)
-            logging.info("Starting LeaderArm Auto-Homing to Robot's Current Pose...")
+            logging.info(
+                "Starting LeaderArm Auto-Homing to Robot's Current Pose (duration=%.1fs, current_scale=%.2f)...",
+                args.autohome_time,
+                args.autohome_current,
+            )
             success, final_q, errors = auto_home_leader_arm(
                 leader_arm=leader_arm,
                 target_pose=target_leader_q,
                 duration=args.autohome_time,
                 tolerance=args.autohome_tolerance,
+                current_scale=args.autohome_current,
             )
             if not success:
-                logging.warning("LeaderArm Auto-Homing finished with errors exceeding tolerance. Proceeding with caution.")
+                max_err = float(np.max(errors))
+                max_idx = int(np.argmax(errors))
+                side = "Right" if max_idx < 7 else "Left"
+                joint_idx = max_idx % 7
+                logging.warning(
+                    "LeaderArm Auto-Homing finished with errors exceeding tolerance (tol=%.3f rad / %.1f deg). "
+                    "Max error: %.3f rad (%.1f deg) on %s joint %d (motor %d). "
+                    "Joint errors (deg): Right=%s, Left=%s",
+                    args.autohome_tolerance,
+                    np.rad2deg(args.autohome_tolerance),
+                    max_err,
+                    np.rad2deg(max_err),
+                    side,
+                    joint_idx,
+                    max_idx,
+                    np.round(np.rad2deg(errors[0:7]), 1).tolist(),
+                    np.round(np.rad2deg(errors[7:14]), 1).tolist(),
+                )
             else:
                 logging.info("LeaderArm Auto-Homing completed successfully!")
             logging.info("=" * 60)
@@ -559,7 +597,8 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
         ma_max_q = np.deg2rad(
             [360, -10, 90, -60, 90, 80, 360, 360, 30, 0, -60, 90, 80, 360]
         )
-        ma_torque_limit = np.array([3.5, 3.5, 3.5, 1.5, 1.5, 1.5, 1.5] * 2)
+        # Holding torque in teleop mode: boosted elbow to 3.0 Nm to prevent gravity sag when idle
+        ma_torque_limit = np.array([4.0, 4.0, 4.0, 3.0, 2.0, 2.0, 2.0] * 2, dtype=np.float64)
         ma_viscous_gain = np.array(
             [0.02, 0.02, 0.02, 0.02, 0.01, 0.01, 0.002] * 2
         )
@@ -606,6 +645,7 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
             nonlocal last_collision_log_time
             nonlocal last_reported_base_command
             nonlocal last_mobile_send_time, last_mobile_state_log_time
+            nonlocal arm_stream, mobility_stream
 
             if stop_event.is_set():
                 return None
@@ -772,13 +812,19 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
             base_command = keyboard.get_command()
             teleop_publisher.publish(gripper_command, base_command, state.q_joint)
             if has_body_command:
-                arm_stream.send_command(
-                    rby.RobotCommandBuilder().set_command(
-                        rby.ComponentBasedCommandBuilder().set_body_command(
-                            body_builder
+                try:
+                    if arm_stream is None or arm_stream.is_done():
+                        arm_stream = robot.create_command_stream(priority=args.priority)
+                    arm_stream.send_command(
+                        rby.RobotCommandBuilder().set_command(
+                            rby.ComponentBasedCommandBuilder().set_body_command(
+                                body_builder
+                            )
                         )
                     )
-                )
+                except Exception as exc:
+                    logging.warning("Arm stream send failed: %s", exc)
+                    arm_stream = None
 
             now = time.monotonic()
             command_changed = not np.array_equal(
@@ -786,25 +832,33 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
             )
             refresh_due = now - last_mobile_send_time >= args.mobile_refresh_time
             if command_changed or refresh_due:
-                feedback = mobility_stream.send_command(
-                    rby.RobotCommandBuilder().set_command(
-                        rby.ComponentBasedCommandBuilder().set_mobility_command(
-                            _build_mobile_command(base_command, args)
+                try:
+                    if mobility_stream is None or mobility_stream.is_done():
+                        mobility_stream = robot.create_command_stream(
+                            priority=args.mobility_priority
+                        )
+                    feedback = mobility_stream.send_command(
+                        rby.RobotCommandBuilder().set_command(
+                            rby.ComponentBasedCommandBuilder().set_mobility_command(
+                                _build_mobile_command(base_command, args)
+                            )
                         )
                     )
-                )
-                last_mobile_send_time = now
+                    last_mobile_send_time = now
 
-            if command_changed:
-                logging.info(
-                    "Mobile command sent: vx=%+.3f m/s, wz=%+.3f rad/s "
-                    "(status=%s, finish=%s)",
-                    base_command[0],
-                    base_command[2],
-                    feedback.status,
-                    feedback.finish_code,
-                )
-                last_reported_base_command = base_command.copy()
+                    if command_changed:
+                        logging.info(
+                            "Mobile command sent: vx=%+.3f m/s, wz=%+.3f rad/s "
+                            "(status=%s, finish=%s)",
+                            base_command[0],
+                            base_command[2],
+                            feedback.status,
+                            feedback.finish_code,
+                        )
+                        last_reported_base_command = base_command.copy()
+                except Exception as exc:
+                    logging.warning("Mobility stream send failed: %s", exc)
+                    mobility_stream = None
 
             if np.any(base_command) and now - last_mobile_state_log_time >= 0.5:
                 with state_lock:
@@ -989,8 +1043,8 @@ def create_parser(description: str = __doc__) -> argparse.ArgumentParser:
     parser.add_argument(
         "--mobile-hold-time",
         type=float,
-        default=0.75,
-        help="Mobility command hold time [s]",
+        default=2.0,
+        help="Mobility command hold time [s] (default: 2.0)",
     )
     parser.add_argument(
         "--mobile-ramp-time",
@@ -1039,14 +1093,14 @@ def create_parser(description: str = __doc__) -> argparse.ArgumentParser:
     parser.add_argument(
         "--autohome-time",
         type=float,
-        default=4.0,
-        help="Leader-arm auto-homing S-curve duration in seconds (default: 4.0)",
+        default=6.0,
+        help="Leader-arm auto-homing S-curve duration in seconds (default: 6.0)",
     )
     parser.add_argument(
         "--autohome-current",
         type=float,
         default=1.0,
-        help="Leader-arm auto-homing torque/current scale (default: 1.0 = standard limits: 3.5 Nm shoulder, 2.5 Nm elbow, 1.5 Nm wrist)",
+        help="Leader-arm auto-homing torque/current scale (default: 1.0 = base limits: 4.5 Nm shoulder, 3.5 Nm elbow, 2.0 Nm wrist)",
     )
     parser.add_argument(
         "--autohome-tolerance",
