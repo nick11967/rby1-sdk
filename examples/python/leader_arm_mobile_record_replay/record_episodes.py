@@ -33,6 +33,8 @@ import rby1_sdk as rby
 
 from camera_io import (
     CameraSessionProcess,
+    COLLECTION_PROFILES,
+    DEFAULT_COLLECTION_PROFILE,
     DEFAULT_CAMERA_PYTHON,
     DEFAULT_CAMERA_STACK_ROOT,
     DEFAULT_ZED_RECORD_PROFILE,
@@ -121,15 +123,18 @@ class KeyboardListener:
                 self.key_callback(char)
 
 
-def check_camera_shm_status() -> Dict[str, bool]:
-    """Check if camera shared memory segments exist in /dev/shm."""
+def check_camera_shm_status(
+    collection_profile: str = DEFAULT_COLLECTION_PROFILE,
+) -> Dict[str, bool]:
+    """Check if required camera shared memory segments exist in /dev/shm for profile."""
+    roles = COLLECTION_PROFILES.get(
+        collection_profile, COLLECTION_PROFILES[DEFAULT_COLLECTION_PROFILE]
+    )
     shm_dir = Path("/dev/shm")
-    status = {
-        "head": (shm_dir / "head_frame_shm").exists(),
-        "right_wrist": (shm_dir / "right_wrist_frame_shm").exists(),
-        "left_wrist": (shm_dir / "left_wrist_frame_shm").exists(),
+    return {
+        role: (shm_dir / f"{role}_frame_shm").exists()
+        for role in roles
     }
-    return status
 
 
 class EpisodeBuffer:
@@ -320,6 +325,12 @@ def create_parser() -> argparse.ArgumentParser:
         help="Camera recording rate [Hz]",
     )
     parser.add_argument(
+        "--collection-profile",
+        choices=tuple(COLLECTION_PROFILES.keys()),
+        default=DEFAULT_COLLECTION_PROFILE,
+        help="Camera collection profile ('full' for 3 cameras, 'left-pick-minimal' for head and left wrist)",
+    )
+    parser.add_argument(
         "--zed-shm-mode",
         choices=ZED_SHM_MODES,
         default="rgb-only",
@@ -424,16 +435,17 @@ def main() -> int:
 
     # Camera SHM Diagnostics
     if not args.no_cameras:
-        shm_status = check_camera_shm_status()
+        shm_status = check_camera_shm_status(args.collection_profile)
         shm_all_ok = all(shm_status.values())
-        print("Camera Shared Memory Status:")
+        print(f"Camera Shared Memory Status ({args.collection_profile}):")
         for cam_name, is_ok in shm_status.items():
             print(f"  - {cam_name:12s} (/dev/shm/{cam_name}_frame_shm): {'[OK]' if is_ok else '[MISSING - not running]'}")
         if not shm_all_ok:
-            print("\n[!] WARNING: One or more camera SHM streams are missing.")
+            missing = [k for k, v in shm_status.items() if not v]
+            missing_roles = ", ".join(missing)
+            print("\n[!] WARNING: One or more camera SHM streams are missing (" + missing_roles + ").")
             print("    Please run: /home/nvidia/arpa_h_demo_robot_side/camera_stack/run_cameras.sh --zed-mode rgb-only")
             print("    Or run with --no-cameras to record robot kinematics only.")
-
     print("\nControls:")
     print("  [s] : START recording episode")
     print("  [e] : STOP and SAVE current episode")
@@ -497,6 +509,7 @@ def main() -> int:
                             camera_stack_root=args.camera_stack_root,
                             output=current_camera_output,
                             camera_hz=args.camera_hz,
+                            collection_profile=args.collection_profile,
                             zed_shm_mode=args.zed_shm_mode,
                             zed_record_profile=args.zed_record_profile,
                             max_frame_age_s=args.camera_max_frame_age_s,
@@ -527,7 +540,8 @@ def main() -> int:
                 if listener is not None:
                     listener.flush()
                 buffer.start()
-                cam_msg = " + 3 Cameras" if camera_session is not None else ""
+                cam_count = len(COLLECTION_PROFILES.get(args.collection_profile, ()))
+                cam_msg = f" + {cam_count} Cameras" if camera_session is not None else ""
                 print(f"\n>>> [● RECORDING START] Episode #{current_episode_idx:04d} recording started{cam_msg}!")
                 print("    Press 'e' to stop and save, 'x' to discard.")
 

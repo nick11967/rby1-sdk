@@ -40,6 +40,11 @@ ZED_RECORD_PROFILES = {
     "fast": (400, 640),
 }
 DEFAULT_ZED_RECORD_PROFILE = "record"
+COLLECTION_PROFILES: dict[str, tuple[str, ...]] = {
+    "full": ("head", "right_wrist", "left_wrist"),
+    "left-pick-minimal": ("head", "left_wrist"),
+}
+DEFAULT_COLLECTION_PROFILE = "full"
 
 
 def camera_sidecar_path(robot_recording: Path) -> Path:
@@ -293,7 +298,19 @@ class CameraHdf5Writer:
         jpeg_quality: int,
         compression: str,
         capacity_block: int = 120,
+        collection_profile: str = DEFAULT_COLLECTION_PROFILE,
+        camera_roles: tuple[str, ...] | list[str] | None = None,
     ) -> None:
+        if collection_profile not in COLLECTION_PROFILES:
+            raise ValueError(
+                f"unknown collection profile: {collection_profile}, "
+                f"supported: {tuple(COLLECTION_PROFILES)}"
+            )
+        if camera_roles is None:
+            self._camera_roles = COLLECTION_PROFILES[collection_profile]
+        else:
+            self._camera_roles = tuple(camera_roles)
+        self._collection_profile = collection_profile
         try:
             import h5py
         except ImportError as exc:
@@ -333,7 +350,8 @@ class CameraHdf5Writer:
         meta.attrs["schema_version"] = 2
         meta.attrs["camera_hz"] = float(camera_hz)
         meta.attrs["color_order"] = "RGB"
-        meta.attrs["camera_roles"] = CAMERA_ROLES
+        meta.attrs["collection_profile"] = self._collection_profile
+        meta.attrs["camera_roles"] = list(self._camera_roles)
         meta.attrs["source"] = "camera_stack_shared_memory"
         meta.attrs["zed_shm_mode"] = zed_shm_mode
         meta.attrs["zed_record_profile"] = zed_record_profile
@@ -377,7 +395,7 @@ class CameraHdf5Writer:
         cameras = self._h5.create_group("cameras")
         self._images = {}
         self._frame_shapes = dict(frame_shapes)
-        for role in CAMERA_ROLES:
+        for role in self._camera_roles:
             frame_shape = self._frame_shapes[role]
             group = cameras.create_group(role)
             group.attrs["source_role"] = role
@@ -454,7 +472,7 @@ class CameraHdf5Writer:
         if self._first_monotonic_ns is None:
             self._first_monotonic_ns = monotonic_ns
         self._last_monotonic_ns = monotonic_ns
-        for role in CAMERA_ROLES:
+        for role in self._camera_roles:
             frame = frames_bgr[role]
             expected_shape = self._frame_shapes[role]
             if frame.shape != expected_shape or frame.dtype != np.uint8:
@@ -642,6 +660,12 @@ def camera_worker(args: argparse.Namespace) -> int:
     unavailable_since = None
     last_head_source_monotonic_ns = None
     output_path = Path(args.output).resolve() if args.output else None
+    if args.collection_profile not in COLLECTION_PROFILES:
+        raise ValueError(
+            f"unknown collection profile: {args.collection_profile}, "
+            f"supported: {tuple(COLLECTION_PROFILES)}"
+        )
+    active_roles = COLLECTION_PROFILES[args.collection_profile]
 
     try:
         (
@@ -733,23 +757,31 @@ def camera_worker(args: argparse.Namespace) -> int:
             next_sample = max(next_sample + period, now)
 
             try:
-                if args.zed_shm_mode == "rgb-only":
-                    head_snapshot = wrist_reader.get_head_snapshot()
-                    head_bgr = head_snapshot.frame
-                    head_source_monotonic_ns = (
-                        head_snapshot.monotonic_timestamp_ns
-                    )
-                    head_camera_ns = 0
+                if "head" in active_roles:
+                    if args.zed_shm_mode == "rgb-only":
+                        head_snapshot = wrist_reader.get_head_snapshot()
+                        head_bgr = head_snapshot.frame
+                        head_source_monotonic_ns = (
+                            head_snapshot.monotonic_timestamp_ns
+                        )
+                        head_camera_ns = 0
+                    else:
+                        zed = zed_reader.get_latest_snapshot()
+                        head_bgr = zed.left_bgr
+                        head_source_monotonic_ns = zed.monotonic_timestamp_ns
+                        head_camera_ns = zed.camera_timestamp_ns
                 else:
-                    zed = zed_reader.get_latest_snapshot()
-                    head_bgr = zed.left_bgr
-                    head_source_monotonic_ns = zed.monotonic_timestamp_ns
-                    head_camera_ns = zed.camera_timestamp_ns
-                frames = {
-                    "head": head_bgr,
-                    "right_wrist": wrist_reader.get_right_wrist_frame(),
-                    "left_wrist": wrist_reader.get_left_wrist_frame(),
-                }
+                    head_bgr = None
+                    head_source_monotonic_ns = 0
+                    head_camera_ns = 0
+
+                frames = {}
+                if "head" in active_roles:
+                    frames["head"] = head_bgr
+                if "right_wrist" in active_roles:
+                    frames["right_wrist"] = wrist_reader.get_right_wrist_frame()
+                if "left_wrist" in active_roles:
+                    frames["left_wrist"] = wrist_reader.get_left_wrist_frame()
             except (CameraShmError, ZedStereoShmError) as exc:
                 error_time = time.monotonic()
                 if unavailable_since is None:
@@ -795,14 +827,17 @@ def camera_worker(args: argparse.Namespace) -> int:
                         ]
                         head_shape = (head_height, head_width, 3)
                         zed_record_profile = args.zed_record_profile
+                    writer_frame_shapes = {}
+                    for role in active_roles:
+                        if role == "head":
+                            writer_frame_shapes["head"] = head_shape
+                        else:
+                            writer_frame_shapes[role] = WRIST_FRAME_SHAPE
+
                     writer = CameraHdf5Writer(
                         output_path,
                         camera_hz=args.camera_hz,
-                        frame_shapes={
-                            "head": head_shape,
-                            "right_wrist": WRIST_FRAME_SHAPE,
-                            "left_wrist": WRIST_FRAME_SHAPE,
-                        },
+                        frame_shapes=writer_frame_shapes,
                         head_source_shape=(
                             ZED_RGB_ONLY_SHAPE
                             if args.zed_shm_mode == "rgb-only"
@@ -813,6 +848,8 @@ def camera_worker(args: argparse.Namespace) -> int:
                         storage_format=args.storage_format,
                         jpeg_quality=args.jpeg_quality,
                         compression=args.compression,
+                        collection_profile=args.collection_profile,
+                        camera_roles=active_roles,
                     )
                 writer.append(
                     recorded_frames,
@@ -824,19 +861,27 @@ def camera_worker(args: argparse.Namespace) -> int:
             frame_count += 1
 
             if preview_enabled and time.monotonic() >= next_preview:
-                panels = [
-                    _make_preview_panel(
-                        cv2, frames["right_wrist"], "Right wrist", args.panel_width
-                    ),
-                    _make_preview_panel(
-                        cv2, frames["head"], "Head", args.panel_width
-                    ),
-                    _make_preview_panel(
-                        cv2, frames["left_wrist"], "Left wrist", args.panel_width
-                    ),
-                ]
-                canvas = np.hstack(panels)
-                if preview_backend == "window":
+                panels = []
+                if "right_wrist" in active_roles and "right_wrist" in frames:
+                    panels.append(
+                        _make_preview_panel(
+                            cv2, frames["right_wrist"], "Right wrist", args.panel_width
+                        )
+                    )
+                if "head" in active_roles and "head" in frames:
+                    panels.append(
+                        _make_preview_panel(
+                            cv2, frames["head"], "Head", args.panel_width
+                        )
+                    )
+                if "left_wrist" in active_roles and "left_wrist" in frames:
+                    panels.append(
+                        _make_preview_panel(
+                            cv2, frames["left_wrist"], "Left wrist", args.panel_width
+                        )
+                    )
+                canvas = np.hstack(panels) if panels else None
+                if canvas is not None and preview_backend == "window":
                     cv2.imshow(window_name, canvas)
                     key = cv2.waitKey(1) & 0xFF
                     if key in (27, ord("q")):
@@ -844,15 +889,17 @@ def camera_worker(args: argparse.Namespace) -> int:
                         cv2.destroyWindow(window_name)
                         preview_enabled = False
                         preview_backend = None
-                elif preview_backend == "browser":
+                elif canvas is not None and preview_backend == "browser":
                     browser_preview.update(cv2, canvas)
                 next_preview = time.monotonic() + preview_period
 
             if first_sample:
                 Path(args.ready_file).write_text("ready\n", encoding="ascii")
                 logging.info(
-                    "Camera SHM ready (%s): head, right_wrist, left_wrist%s",
+                    "Camera SHM ready (%s, %s): %s%s",
+                    args.collection_profile,
                     args.zed_shm_mode,
+                    ", ".join(active_roles),
                     f"; recording to {output_path}" if output_path else "",
                 )
                 first_sample = False
@@ -910,6 +957,7 @@ class CameraSessionProcess:
         camera_stack_root: Path = DEFAULT_CAMERA_STACK_ROOT,
         output: Optional[Path] = None,
         camera_hz: float = 30.0,
+        collection_profile: str = DEFAULT_COLLECTION_PROFILE,
         zed_shm_mode: str = "rgb-only",
         zed_record_profile: str = DEFAULT_ZED_RECORD_PROFILE,
         max_frame_age_s: float = 1.0,
@@ -926,8 +974,14 @@ class CameraSessionProcess:
     ) -> None:
         self.camera_python = Path(camera_python).expanduser()
         self.camera_stack_root = Path(camera_stack_root).expanduser()
+        if collection_profile not in COLLECTION_PROFILES:
+            raise ValueError(
+                f"unknown collection profile: {collection_profile}, "
+                f"supported: {tuple(COLLECTION_PROFILES)}"
+            )
         self.output = Path(output) if output is not None else None
         self.camera_hz = camera_hz
+        self.collection_profile = collection_profile
         self.zed_shm_mode = zed_shm_mode
         self.zed_record_profile = zed_record_profile
         self.max_frame_age_s = max_frame_age_s
@@ -965,6 +1019,8 @@ class CameraSessionProcess:
             str(self.camera_stack_root),
             "--camera-hz",
             str(self.camera_hz),
+            "--collection-profile",
+            self.collection_profile,
             "--zed-shm-mode",
             self.zed_shm_mode,
             "--zed-record-profile",
@@ -1058,6 +1114,11 @@ def create_worker_parser() -> argparse.ArgumentParser:
     parser.add_argument("--worker", action="store_true")
     parser.add_argument("--camera-stack-root", type=Path, required=True)
     parser.add_argument("--camera-hz", type=float, default=30.0)
+    parser.add_argument(
+        "--collection-profile",
+        choices=tuple(COLLECTION_PROFILES),
+        default=DEFAULT_COLLECTION_PROFILE,
+    )
     parser.add_argument(
         "--zed-shm-mode", choices=ZED_SHM_MODES, default="rgb-only"
     )
