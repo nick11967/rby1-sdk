@@ -26,6 +26,7 @@ import termios
 import threading
 import time
 import tty
+import math
 from typing import Dict, List, Optional
 
 import numpy as np
@@ -42,6 +43,12 @@ from camera_io import (
     ZED_SHM_MODES,
     camera_sidecar_path,
     TeleopStateSubscriber,
+)
+from gripper_state_client import (
+    GripperError,
+    GripperStateClient,
+    GripperStateSampler,
+    MeasuredGripperSample,
 )
 
 
@@ -140,14 +147,30 @@ def check_camera_shm_status(
 class EpisodeBuffer:
     """Thread-safe buffer holding samples for a single recording episode."""
 
-    def __init__(self, model_name: str, joint_names: List[str]) -> None:
+    def __init__(
+        self,
+        model_name: str,
+        joint_names: List[str],
+        collection_profile: str = DEFAULT_COLLECTION_PROFILE,
+        left_arm_idx: Optional[List[int]] = None,
+        gripper_sampler: Optional[GripperStateSampler] = None,
+        gripper_max_age_s: float = 0.2,
+    ) -> None:
         self.model_name = model_name
         self.joint_names = joint_names
+        self.collection_profile = collection_profile
+        self.left_arm_idx = list(left_arm_idx) if left_arm_idx is not None else []
+        self.gripper_sampler = gripper_sampler
+        self.gripper_max_age_s = gripper_max_age_s
+
         self.started_monotonic_ns = 0
         self.started_unix_ns = 0
         self.is_recording = False
+        self.is_corrupted = False
+        self.corruption_reason = ""
         self.teleop_sub = TeleopStateSubscriber()
         self._lock = threading.Lock()
+        self._latest_robot_state: Optional[rby.RobotState] = None
 
         self.time_s: List[float] = []
         self.monotonic_ns: List[int] = []
@@ -164,10 +187,28 @@ class EpisodeBuffer:
         self.base_command: List[np.ndarray] = []
         self.leader_position: List[np.ndarray] = []
 
+        # Observation fields for left-pick-minimal profile (DATA-04B)
+        self.left_arm_position_rad: List[np.ndarray] = []
+        self.left_gripper_position_normalized: List[float] = []
+        self.left_gripper_source_monotonic_ns: List[int] = []
+        self.left_pick_observation_state: List[np.ndarray] = []
+
+    @property
+    def latest_robot_state(self) -> Optional[rby.RobotState]:
+        with self._lock:
+            return self._latest_robot_state
+
+    def mark_corrupted(self, reason: str) -> None:
+        self.is_corrupted = True
+        self.corruption_reason = reason
+        logging.error("EpisodeBuffer corrupted: %s", reason)
+
     def start(self) -> None:
         with self._lock:
             self.started_monotonic_ns = time.monotonic_ns()
             self.started_unix_ns = time.time_ns()
+            self.is_corrupted = False
+            self.corruption_reason = ""
             self.time_s.clear()
             self.monotonic_ns.clear()
             self.unix_ns.clear()
@@ -182,15 +223,65 @@ class EpisodeBuffer:
             self.gripper_command.clear()
             self.base_command.clear()
             self.leader_position.clear()
+            self.left_arm_position_rad.clear()
+            self.left_gripper_position_normalized.clear()
+            self.left_gripper_source_monotonic_ns.clear()
+            self.left_pick_observation_state.clear()
             self.is_recording = True
 
     def append_sample(self, state: rby.RobotState) -> None:
         with self._lock:
-            if not self.is_recording:
+            self._latest_robot_state = state
+            if not self.is_recording or self.is_corrupted:
                 return
             now_mono = time.monotonic_ns()
             elapsed_s = (now_mono - self.started_monotonic_ns) / 1e9
             wall_ns = self.started_unix_ns + (now_mono - self.started_monotonic_ns)
+
+            # Left-pick-minimal profile observation extraction & validation
+            if self.collection_profile == "left-pick-minimal":
+                # 1. Measured left arm joint positions (7D)
+                if len(self.left_arm_idx) != 7:
+                    self.mark_corrupted(
+                        f"Invalid left_arm_idx length {len(self.left_arm_idx)}, expected 7"
+                    )
+                    return
+                left_q = np.asarray(state.position[self.left_arm_idx], dtype=np.float64)
+                if left_q.shape != (7,) or not np.all(np.isfinite(left_q)):
+                    self.mark_corrupted(
+                        f"Left arm measured joint position is not finite 7D: {left_q}"
+                    )
+                    return
+
+                # 2. Measured gripper normalized position (1D) from daemon
+                if self.gripper_sampler is None:
+                    self.mark_corrupted(
+                        "Gripper sampler is not initialized for left-pick-minimal profile"
+                    )
+                    return
+
+                try:
+                    g_sample = self.gripper_sampler.get_latest_sample(max_age_s=self.gripper_max_age_s)
+                except Exception as exc:
+                    self.mark_corrupted(f"Failed to obtain fresh gripper sample: {exc}")
+                    return
+
+                g_pos = g_sample.normalized_position
+                if not (math.isfinite(g_pos) and 0.0 <= g_pos <= 1.0):
+                    self.mark_corrupted(
+                        f"Measured gripper position out of range [0.0, 1.0] or not finite: {g_pos}"
+                    )
+                    return
+
+                # Observation 8D
+                obs_8d = np.empty(8, dtype=np.float64)
+                obs_8d[:7] = left_q
+                obs_8d[7] = g_pos
+
+                self.left_arm_position_rad.append(left_q)
+                self.left_gripper_position_normalized.append(g_pos)
+                self.left_gripper_source_monotonic_ns.append(int(g_sample.received_monotonic_ns))
+                self.left_pick_observation_state.append(obs_8d)
 
             self.time_s.append(elapsed_s)
             self.monotonic_ns.append(now_mono)
@@ -229,39 +320,65 @@ class EpisodeBuffer:
     def stop_and_save(self, file_path: Path) -> int:
         with self._lock:
             self.is_recording = False
+            if self.is_corrupted:
+                logging.error(
+                    "EpisodeBuffer is corrupted (%s); refusing to save %s",
+                    self.corruption_reason,
+                    file_path,
+                )
+                return 0
+
             count = len(self.time_s)
             if count == 0:
                 logging.warning("No samples collected; file not saved.")
                 return 0
 
             file_path.parent.mkdir(parents=True, exist_ok=True)
-            np.savez_compressed(
-                file_path,
-                schema_version=np.array(2, dtype=np.int64),
-                model_name=np.array(self.model_name),
-                joint_names=np.asarray(self.joint_names),
-                started_monotonic_ns=np.array(self.started_monotonic_ns, dtype=np.uint64),
-                started_unix_ns=np.array(self.started_unix_ns, dtype=np.uint64),
-                time_s=np.asarray(self.time_s, dtype=np.float64),
-                monotonic_ns=np.asarray(self.monotonic_ns, dtype=np.uint64),
-                unix_ns=np.asarray(self.unix_ns, dtype=np.uint64),
-                position=np.asarray(self.position, dtype=np.float64),
-                velocity=np.asarray(self.velocity, dtype=np.float64),
-                current=np.asarray(self.current, dtype=np.float64),
-                torque=np.asarray(self.torque, dtype=np.float64),
-                target_position=np.asarray(self.target_position, dtype=np.float64),
-                target_velocity=np.asarray(self.target_velocity, dtype=np.float64),
-                odometry=np.asarray(self.odometry, dtype=np.float64),
-                odometry_pose=np.asarray(self.odometry_pose, dtype=np.float64),
-                gripper_command=np.asarray(self.gripper_command, dtype=np.float64),
-                base_command=np.asarray(self.base_command, dtype=np.float64),
-                leader_position=np.asarray(self.leader_position, dtype=np.float64),
-            )
+            save_dict = {
+                "schema_version": np.array(2, dtype=np.int64),
+                "model_name": np.array(self.model_name),
+                "joint_names": np.asarray(self.joint_names),
+                "started_monotonic_ns": np.array(self.started_monotonic_ns, dtype=np.uint64),
+                "started_unix_ns": np.array(self.started_unix_ns, dtype=np.uint64),
+                "time_s": np.asarray(self.time_s, dtype=np.float64),
+                "monotonic_ns": np.asarray(self.monotonic_ns, dtype=np.uint64),
+                "unix_ns": np.asarray(self.unix_ns, dtype=np.uint64),
+                "position": np.asarray(self.position, dtype=np.float64),
+                "velocity": np.asarray(self.velocity, dtype=np.float64),
+                "current": np.asarray(self.current, dtype=np.float64),
+                "torque": np.asarray(self.torque, dtype=np.float64),
+                "target_position": np.asarray(self.target_position, dtype=np.float64),
+                "target_velocity": np.asarray(self.target_velocity, dtype=np.float64),
+                "odometry": np.asarray(self.odometry, dtype=np.float64),
+                "odometry_pose": np.asarray(self.odometry_pose, dtype=np.float64),
+                "gripper_command": np.asarray(self.gripper_command, dtype=np.float64),
+                "base_command": np.asarray(self.base_command, dtype=np.float64),
+                "leader_position": np.asarray(self.leader_position, dtype=np.float64),
+            }
+
+            if self.collection_profile == "left-pick-minimal":
+                save_dict["left_arm_position_rad"] = np.asarray(
+                    self.left_arm_position_rad, dtype=np.float64
+                )
+                save_dict["left_gripper_position_normalized"] = np.asarray(
+                    self.left_gripper_position_normalized, dtype=np.float64
+                )
+                save_dict["left_gripper_source_monotonic_ns"] = np.asarray(
+                    self.left_gripper_source_monotonic_ns, dtype=np.uint64
+                )
+                save_dict["left_pick_observation_state"] = np.asarray(
+                    self.left_pick_observation_state, dtype=np.float64
+                )
+                save_dict["collection_profile"] = np.array("left-pick-minimal")
+
+            np.savez_compressed(file_path, **save_dict)
             return count
 
     def discard(self) -> None:
         with self._lock:
             self.is_recording = False
+            self.is_corrupted = False
+            self.corruption_reason = ""
             self.time_s.clear()
             self.monotonic_ns.clear()
             self.unix_ns.clear()
@@ -276,6 +393,10 @@ class EpisodeBuffer:
             self.gripper_command.clear()
             self.base_command.clear()
             self.leader_position.clear()
+            self.left_arm_position_rad.clear()
+            self.left_gripper_position_normalized.clear()
+            self.left_gripper_source_monotonic_ns.clear()
+            self.left_pick_observation_state.clear()
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -334,7 +455,38 @@ def create_parser() -> argparse.ArgumentParser:
         "--zed-shm-mode",
         choices=ZED_SHM_MODES,
         default="rgb-only",
-        help="Must match run_cameras.sh --zed-mode; default is the 30 Hz RGB-only collection mode",
+        help="Must match run_cameras.sh --zed-mode (e.g. stereo-rgb or rgb-only)",
+    )
+
+    # Gripper Daemon Arguments (DATA-04B)
+    parser.add_argument(
+        "--gripper-host",
+        default="127.0.0.1",
+        help="Gripper daemon host (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--gripper-port",
+        type=int,
+        default=8888,
+        help="Gripper daemon port (default: 8888)",
+    )
+    parser.add_argument(
+        "--gripper-id",
+        type=int,
+        default=1,
+        help="Expected left gripper ID in daemon (default: 1)",
+    )
+    parser.add_argument(
+        "--gripper-state-hz",
+        type=float,
+        default=30.0,
+        help="Gripper state polling rate in Hz (default: 30.0)",
+    )
+    parser.add_argument(
+        "--gripper-max-age-s",
+        type=float,
+        default=0.2,
+        help="Maximum allowed gripper sample age in seconds (default: 0.2s)",
     )
     parser.add_argument(
         "--zed-record-profile",
@@ -444,7 +596,9 @@ def main() -> int:
             missing = [k for k, v in shm_status.items() if not v]
             missing_roles = ", ".join(missing)
             print("\n[!] WARNING: One or more camera SHM streams are missing (" + missing_roles + ").")
-            print("    Please run: /home/nvidia/arpa_h_demo_robot_side/camera_stack/run_cameras.sh --zed-mode rgb-only")
+            print("    Please run: /home/nvidia/arpa_h_demo_robot_side/camera_stack/run_cameras.sh --zed-mode stereo-rgb")
+            # Note: --head-view right can be added after camera daemon update is merged
+            print("    (Note: --head-view right can be added after camera daemon update is merged)")
             print("    Or run with --no-cameras to record robot kinematics only.")
     print("\nControls:")
     print("  [s] : START recording episode")
@@ -452,6 +606,23 @@ def main() -> int:
     print("  [x] : CANCEL / DISCARD current episode (do not save)")
     print("  [q] : QUIT recorder (or Ctrl+C)")
     print("=" * 65 + "\n")
+
+    gripper_sampler: Optional[GripperStateSampler] = None
+    if args.collection_profile == "left-pick-minimal":
+        print(
+            f"Connecting to Gripper Daemon at {args.gripper_host}:{args.gripper_port} (expected_id={args.gripper_id})..."
+        )
+        gripper_client = GripperStateClient(
+            host=args.gripper_host,
+            port=args.gripper_port,
+            expected_id=args.gripper_id,
+        )
+        gripper_sampler = GripperStateSampler(
+            client=gripper_client,
+            hz=args.gripper_state_hz,
+            max_age_s=args.gripper_max_age_s,
+        )
+        gripper_sampler.start()
 
     try:
         logging.info("Connecting to robot state stream at %s (Read-Only mode)...", args.address)
@@ -461,7 +632,14 @@ def main() -> int:
             return 1
 
         model = robot.model()
-        buffer = EpisodeBuffer(model.model_name, list(model.robot_joint_names))
+        buffer = EpisodeBuffer(
+            model_name=model.model_name,
+            joint_names=list(model.robot_joint_names),
+            collection_profile=args.collection_profile,
+            left_arm_idx=list(model.left_arm_idx),
+            gripper_sampler=gripper_sampler,
+            gripper_max_age_s=args.gripper_max_age_s,
+        )
 
         def on_robot_state(state):
             state_received_event.set()
@@ -496,6 +674,86 @@ def main() -> int:
                 if state == "RECORDING":
                     print(f"\n[!] Already recording Episode #{current_episode_idx:04d}!")
                     return
+
+                # Fail-closed pre-recording checks for left-pick-minimal
+                if args.collection_profile == "left-pick-minimal":
+                    if gripper_sampler is None:
+                        print("\n[!] ERROR: Cannot start recording: Gripper sampler is not initialized!")
+                        state = "IDLE"
+                        if listener is not None:
+                            listener.flush()
+                        print_idle_prompt()
+                        return
+
+                    # 1. Check gripper daemon connection and sample freshness/validity
+                    try:
+                        gripper_sample = gripper_sampler.get_latest_sample(
+                            max_age_s=args.gripper_max_age_s
+                        )
+                    except Exception as exc:
+                        print(
+                            f"\n[!] ERROR: Cannot start recording: Gripper daemon check failed: {exc}"
+                        )
+                        state = "IDLE"
+                        if listener is not None:
+                            listener.flush()
+                        print_idle_prompt()
+                        return
+
+                    if gripper_sample.expected_id != args.gripper_id:
+                        print(
+                            f"\n[!] ERROR: Cannot start recording: Gripper expected ID {args.gripper_id} mismatch: {gripper_sample.expected_id}"
+                        )
+                        state = "IDLE"
+                        if listener is not None:
+                            listener.flush()
+                        print_idle_prompt()
+                        return
+
+                    if not (
+                        math.isfinite(gripper_sample.normalized_position)
+                        and 0.0 <= gripper_sample.normalized_position <= 1.0
+                    ):
+                        print(
+                            f"\n[!] ERROR: Cannot start recording: Measured gripper position invalid/non-finite: {gripper_sample.normalized_position}"
+                        )
+                        state = "IDLE"
+                        if listener is not None:
+                            listener.flush()
+                        print_idle_prompt()
+                        return
+
+                    # 2. Check left arm joint state finite 7D
+                    cur_robot_state = buffer.latest_robot_state
+                    if cur_robot_state is None:
+                        print("\n[!] ERROR: Cannot start recording: No robot state received yet!")
+                        state = "IDLE"
+                        if listener is not None:
+                            listener.flush()
+                        print_idle_prompt()
+                        return
+
+                    left_arm_idx = model.left_arm_idx
+                    if len(left_arm_idx) != 7:
+                        print(
+                            f"\n[!] ERROR: Cannot start recording: Robot model left_arm_idx length is {len(left_arm_idx)}, expected 7!"
+                        )
+                        state = "IDLE"
+                        if listener is not None:
+                            listener.flush()
+                        print_idle_prompt()
+                        return
+
+                    left_q = cur_robot_state.position[left_arm_idx]
+                    if len(left_q) != 7 or not np.all(np.isfinite(left_q)):
+                        print(
+                            f"\n[!] ERROR: Cannot start recording: Left arm measured joints are not finite 7D: {left_q}"
+                        )
+                        state = "IDLE"
+                        if listener is not None:
+                            listener.flush()
+                        print_idle_prompt()
+                        return
 
                 file_name = f"{args.prefix}_{current_episode_idx:04d}.npz"
                 save_path = output_dir / file_name
@@ -557,6 +815,22 @@ def main() -> int:
                         logging.warning("Camera stop error: %s", exc)
                     camera_session = None
 
+                if buffer.is_corrupted:
+                    print(
+                        f"\n[!] ERROR: Episode #{current_episode_idx:04d} was corrupted ({buffer.corruption_reason})! Discarding without saving."
+                    )
+                    if current_camera_output and current_camera_output.exists():
+                        try:
+                            current_camera_output.unlink()
+                        except Exception:
+                            pass
+                    buffer.discard()
+                    state = "IDLE"
+                    if listener is not None:
+                        listener.flush()
+                    print_idle_prompt()
+                    return
+
                 file_name = f"{args.prefix}_{current_episode_idx:04d}.npz"
                 save_path = output_dir / file_name
                 count = buffer.stop_and_save(save_path)
@@ -571,6 +845,11 @@ def main() -> int:
                     print(f"\n>>> [✔ SAVED] Episode #{current_episode_idx:04d} saved to {save_path} ({count} samples, {dur:.2f}s){cam_info}")
                     current_episode_idx += 1
                 else:
+                    if current_camera_output and current_camera_output.exists():
+                        try:
+                            current_camera_output.unlink()
+                        except Exception:
+                            pass
                     print(f"\n>>> [!] Episode #{current_episode_idx:04d} stopped with 0 samples. (File not saved)")
 
                 state = "IDLE"
@@ -613,6 +892,28 @@ def main() -> int:
         while not stop_event.is_set():
             now = time.monotonic()
             if state == "RECORDING":
+                if buffer.is_corrupted:
+                    print(
+                        f"\n\n[!] ERROR: Episode #{current_episode_idx:04d} aborted during recording: {buffer.corruption_reason}!"
+                    )
+                    if camera_session is not None:
+                        try:
+                            camera_session.stop()
+                        except Exception:
+                            pass
+                        camera_session = None
+                    if current_camera_output and current_camera_output.exists():
+                        try:
+                            current_camera_output.unlink()
+                        except Exception:
+                            pass
+                    buffer.discard()
+                    state = "IDLE"
+                    if listener is not None:
+                        listener.flush()
+                    print_idle_prompt()
+                    continue
+
                 if camera_session is not None:
                     try:
                         camera_session.check_health()
@@ -638,6 +939,11 @@ def main() -> int:
         if camera_session is not None:
             try:
                 camera_session.stop()
+            except Exception:
+                pass
+        if gripper_sampler is not None:
+            try:
+                gripper_sampler.stop()
             except Exception:
                 pass
         if robot is not None:
