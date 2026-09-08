@@ -752,9 +752,8 @@ def camera_worker(args: argparse.Namespace) -> int:
                 continue
             now = time.monotonic()
             if now < next_sample:
-                stop_event.wait(min(next_sample - now, 0.005))
+                stop_event.wait(min(next_sample - now, 0.002))
                 continue
-            next_sample = max(next_sample + period, now)
 
             try:
                 if "head" in active_roles:
@@ -803,11 +802,13 @@ def camera_worker(args: argparse.Namespace) -> int:
                 continue
             unavailable_since = None
 
-            # The worker clock may run slightly faster than the producer. Do
-            # not serialize the same head publication twice as a new sample.
-            if head_source_monotonic_ns == last_head_source_monotonic_ns:
+            # If the producer has not published a new head frame yet, wait briefly (1 ms)
+            # and re-poll without advancing next_sample by a full period.
+            if "head" in active_roles and head_source_monotonic_ns == last_head_source_monotonic_ns:
+                stop_event.wait(0.001)
                 continue
             last_head_source_monotonic_ns = head_source_monotonic_ns
+            next_sample = max(next_sample + period, time.monotonic())
 
             captured_monotonic_ns = time.monotonic_ns()
             captured_unix_ns = time.time_ns()
