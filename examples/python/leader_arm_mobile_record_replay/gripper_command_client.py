@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Gripper Command Client for RBY1 Teleoperation (DATA-05A).
+"""Gripper Command Client for RBY1 Teleoperation (DATA-05B).
 
 This module provides a dedicated client for sending gripper actuation commands
 (`set_target`) to the standalone Gripper Daemon over TCP JSONL.
 - Does NOT access /dev/rby1_gripper or DynamixelBus directly.
-- Formats and sends `{"type": "set_target", "id": <id>, "target": <target>}` queries.
-- Maps Left arm gripper to ID 1 and Right arm gripper to ID 0.
+- Transmits strictly `{"type": "set_target", "target": [right, left]}` queries.
+- Array order is always [ID 0 (right), ID 1 (left)].
+- No `id` field is sent over the wire.
 - Validates input targets to normalized range [0.0, 1.0].
 - Handles connection lifecycle, reconnects, and graceful shutdown.
 """
@@ -113,7 +114,11 @@ class SocketCommandTransport:
 
 
 class GripperCommandClient:
-    """Client for controlling gripper positions via Gripper Daemon."""
+    """Client for controlling gripper positions via Gripper Daemon.
+
+    Strict protocol:
+    {"type": "set_target", "target": [right, left]}
+    """
 
     RIGHT_GRIPPER_ID = 0
     LEFT_GRIPPER_ID = 1
@@ -130,7 +135,11 @@ class GripperCommandClient:
         self.timeout_s = timeout_s
         self.transport = transport or SocketCommandTransport(host=host, port=port, timeout_s=timeout_s)
         self._lock = threading.Lock()
-        self._last_targets: Dict[int, float] = {}
+        # Internal state tracking: [right (ID 0), left (ID 1)]
+        self._current_targets: Dict[int, float] = {
+            self.RIGHT_GRIPPER_ID: 0.0,
+            self.LEFT_GRIPPER_ID: 0.0,
+        }
 
     def connect(self) -> None:
         """Establish connection to the gripper daemon."""
@@ -156,32 +165,61 @@ class GripperCommandClient:
         return float(min(max(target_val, 0.0), 1.0))
 
     @staticmethod
-    def format_set_target_message(dev_id: int, target: float) -> str:
-        """Create JSON string for set_target command."""
-        if isinstance(dev_id, bool) or not isinstance(dev_id, int) or dev_id < 0:
-            raise GripperCommandValidationError(f"Device ID must be non-negative integer, got {dev_id}")
-        valid_target = GripperCommandClient.validate_target(target)
-        return json.dumps({"type": "set_target", "id": dev_id, "target": round(valid_target, 4)})
+    def format_set_targets_message(right_target: float, left_target: float) -> str:
+        """Create JSON string for set_target command: {"type": "set_target", "target": [right, left]}.
 
-    def set_target(self, dev_id: int, target: float) -> None:
-        """Send a set_target command for a specific gripper motor ID."""
-        msg = self.format_set_target_message(dev_id, target)
+        Strict requirements:
+        - No 'id' field is present.
+        - 'target' is a list of exactly length 2.
+        - target[0] is right gripper (ID 0), target[1] is left gripper (ID 1).
+        """
+        valid_right = GripperCommandClient.validate_target(right_target)
+        valid_left = GripperCommandClient.validate_target(left_target)
+        return json.dumps({
+            "type": "set_target",
+            "target": [round(valid_right, 4), round(valid_left, 4)],
+        })
+
+    def set_targets(self, right_target: float, left_target: float) -> None:
+        """Send target commands for both right (ID 0) and left (ID 1) grippers in a single message."""
+        msg = self.format_set_targets_message(right_target, left_target)
         with self._lock:
             if not self.is_connected():
                 self.connect()
             self.transport.send_line(msg)
-            self._last_targets[dev_id] = float(target)
+            self._current_targets[self.RIGHT_GRIPPER_ID] = GripperCommandClient.validate_target(right_target)
+            self._current_targets[self.LEFT_GRIPPER_ID] = GripperCommandClient.validate_target(left_target)
 
-    def set_targets(self, right_target: float, left_target: float) -> None:
-        """Send target commands for both right (ID 0) and left (ID 1) grippers."""
-        self.set_target(self.RIGHT_GRIPPER_ID, right_target)
-        self.set_target(self.LEFT_GRIPPER_ID, left_target)
+    def set_target(self, dev_id: int, target: float) -> None:
+        """Update target for one gripper ID and send full [right, left] message without 'id' field."""
+        if dev_id not in (self.RIGHT_GRIPPER_ID, self.LEFT_GRIPPER_ID):
+            raise GripperCommandValidationError(
+                f"Device ID must be {self.RIGHT_GRIPPER_ID} (right) or {self.LEFT_GRIPPER_ID} (left), got {dev_id}"
+            )
+        with self._lock:
+            right = target if dev_id == self.RIGHT_GRIPPER_ID else self._current_targets[self.RIGHT_GRIPPER_ID]
+            left = target if dev_id == self.LEFT_GRIPPER_ID else self._current_targets[self.LEFT_GRIPPER_ID]
+            msg = self.format_set_targets_message(right, left)
+            if not self.is_connected():
+                self.connect()
+            self.transport.send_line(msg)
+            self._current_targets[self.RIGHT_GRIPPER_ID] = GripperCommandClient.validate_target(right)
+            self._current_targets[self.LEFT_GRIPPER_ID] = GripperCommandClient.validate_target(left)
 
     def set_command_array(self, command: Sequence[float]) -> None:
         """Send target array [right_target, left_target]."""
         if len(command) < 2:
             raise GripperCommandValidationError(f"Expected at least 2 command values, got {len(command)}")
         self.set_targets(float(command[0]), float(command[1]))
+
+    @property
+    def current_targets(self) -> Tuple[float, float]:
+        """Return the current [right, left] targets."""
+        with self._lock:
+            return (
+                self._current_targets[self.RIGHT_GRIPPER_ID],
+                self._current_targets[self.LEFT_GRIPPER_ID],
+            )
 
     # Compatibility methods mimicking leader_example.Gripper interface
     def initialize(self, verbose: bool = True) -> bool:
@@ -213,16 +251,30 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Gripper Command Client CLI / Diagnostic Tool")
     parser.add_argument("--host", default="127.0.0.1", help="Gripper daemon host (default: 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8888, help="Gripper daemon port (default: 8888)")
-    parser.add_argument("--id", type=int, default=1, help="Gripper device ID (0=right, 1=left)")
-    parser.add_argument("--target", type=float, required=True, help="Target normalized position [0.0..1.0]")
+    parser.add_argument("--right", type=float, default=None, help="Target for right gripper (ID 0) [0.0..1.0]")
+    parser.add_argument("--left", type=float, default=None, help="Target for left gripper (ID 1) [0.0..1.0]")
+    parser.add_argument("--id", type=int, default=None, help="Gripper device ID (0=right, 1=left)")
+    parser.add_argument("--target", type=float, default=None, help="Target normalized position [0.0..1.0]")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     client = GripperCommandClient(host=args.host, port=args.port)
     try:
         client.connect()
-        logging.info(f"Setting target for ID {args.id} to {args.target:.3f}...")
-        client.set_target(args.id, args.target)
+        if args.right is not None or args.left is not None:
+            r = args.right if args.right is not None else 0.0
+            l = args.left if args.left is not None else 0.0
+            logging.info(f"Setting targets: right={r:.3f}, left={l:.3f}...")
+            client.set_targets(r, l)
+        elif args.id is not None and args.target is not None:
+            logging.info(f"Setting target for ID {args.id} to {args.target:.3f}...")
+            client.set_target(args.id, args.target)
+        elif args.target is not None:
+            logging.info(f"Setting both targets to {args.target:.3f}...")
+            client.set_targets(args.target, args.target)
+        else:
+            logging.error("Please specify --right/--left or --id/--target")
+            return 1
         logging.info("Command successfully sent to daemon.")
         return 0
     except Exception as exc:

@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""Offline Unit and Integration Tests for DATA-05A: Teleop Gripper Daemon Migration.
+"""Offline Unit and Integration Tests for DATA-05B: Gripper Command Client Protocol.
 
 Verifies:
-1. Daemon mode opens DynamixelBus 0 times for gripper.
-2. Left arm trigger command is routed to daemon ID 1 with proper set_target format.
-3. Right arm trigger command is routed to daemon ID 0 with proper set_target format.
-4. Trigger values [0..1000] -> [0.0..1.0] normalized set_target conversion.
-5. Value clamping and validation (out of range, NaN/Inf, non-numeric).
-6. Connection failure cleanly handled with safe termination and non-zero exit.
-7. Zero real SDK / hardware calls throughout tests.
-8. Concurrent compatibility: get_state (recorder) and set_target (teleop) can coexist on same daemon wire protocol.
+1. Zero DynamixelBus / SDK opens for gripper in daemon mode.
+2. Single message per set_targets() call: {"type": "set_target", "target": [right, left]}.
+3. Absolutely no "id" field in transmitted messages.
+4. target shape is strictly a list of length 2: target[0] is right (ID 0), target[1] is left (ID 1).
+5. Left trigger update modifies target[1] only; right trigger update modifies target[0] only.
+6. Target normalization [0.0..1.0] and out-of-range clamping / rejection of invalid types.
+7. Server get_state() reflects [right, left] ordering accurately.
+8. Round-trip integration test using strict server handler (DryRunGripper equivalent) over real TCP loopback.
+9. Zero real SDK / hardware calls throughout all tests.
 """
 
 from __future__ import annotations
@@ -18,8 +19,11 @@ from dataclasses import dataclass
 import json
 import math
 from pathlib import Path
+import socket
+import socketserver
 import sys
 import tempfile
+import threading
 import time
 from typing import Any, Dict, List, Optional
 from unittest.mock import MagicMock, patch
@@ -75,101 +79,114 @@ class MockCommandTransport:
 # 1. Verify 0 DynamixelBus opens for gripper
 def test_01_zero_dynamixel_bus_opens_for_gripper():
     """Verify teleop_autohome does not import or instantiate leader_example.Gripper or DynamixelBus for gripper."""
-    # Ensure teleop_autohome does not have leader_example.Gripper
     assert not hasattr(teleop_autohome, "Gripper"), "teleop_autohome should not define or import Gripper"
     
-    # Audit: initialize GripperCommandClient with MockCommandTransport
     transport = MockCommandTransport()
     client = GripperCommandClient(transport=transport)
     assert client.initialize() is True
     assert transport.real_hardware_calls == 0
 
 
-# 2. Left arm trigger command mapped to ID 1
-def test_02_left_arm_trigger_routes_to_id_1():
-    """Verify left arm trigger (trigger / 1000.0) is sent to ID 1."""
+# 2. set_targets sends exactly 1 message with {"type": "set_target", "target": [right, left]}
+def test_02_single_message_format_no_id_length_2():
+    """Verify set_targets sends exactly one message with [right, left] and no 'id' field."""
     transport = MockCommandTransport()
     client = GripperCommandClient(transport=transport)
     client.connect()
 
-    # Squeeze left trigger: 750 / 1000 = 0.75
-    client.set_target(dev_id=1, target=0.75)
+    client.set_targets(right_target=0.25, left_target=0.75)
 
-    assert len(transport.sent_lines) == 1
+    # Must be exactly 1 message
+    assert len(transport.sent_lines) == 1, f"Expected 1 message, got {len(transport.sent_lines)}"
+    
     msg = json.loads(transport.sent_lines[0])
     assert msg["type"] == "set_target"
-    assert msg["id"] == 1
-    assert math.isclose(msg["target"], 0.75, abs_tol=1e-3)
+    assert "id" not in msg, f"Protocol violation: 'id' field must NOT be in message: {msg}"
+    assert isinstance(msg["target"], list), f"target must be a list, got {type(msg['target'])}"
+    assert len(msg["target"]) == 2, f"target must have length 2, got {len(msg['target'])}"
+    assert math.isclose(msg["target"][0], 0.25, abs_tol=1e-3), f"target[0] should be right (0.25), got {msg['target'][0]}"
+    assert math.isclose(msg["target"][1], 0.75, abs_tol=1e-3), f"target[1] should be left (0.75), got {msg['target'][1]}"
 
 
-# 3. Right arm trigger command mapped to ID 0
-def test_03_right_arm_trigger_routes_to_id_0():
-    """Verify right arm trigger is sent to ID 0."""
+# 3. Left trigger update modifies target[1] only
+def test_03_left_trigger_modifies_target_1_only():
+    """Verify updating left gripper (ID 1) preserves target[0] and only changes target[1]."""
     transport = MockCommandTransport()
     client = GripperCommandClient(transport=transport)
     client.connect()
 
-    # Squeeze right trigger: 300 / 1000 = 0.30
-    client.set_target(dev_id=0, target=0.30)
-
+    # Initial state: right=0.30, left=0.40
+    client.set_targets(0.30, 0.40)
     assert len(transport.sent_lines) == 1
-    msg = json.loads(transport.sent_lines[0])
-    assert msg["type"] == "set_target"
-    assert msg["id"] == 0
-    assert math.isclose(msg["target"], 0.30, abs_tol=1e-3)
 
-
-# 4. Both arms simultaneous trigger commands
-def test_04_set_targets_dual_gripper_mapping():
-    """Verify set_targets(right, left) sends ID 0 then ID 1 in correct order with correct values."""
-    transport = MockCommandTransport()
-    client = GripperCommandClient(transport=transport)
-    client.connect()
-
-    client.set_targets(right_target=0.25, left_target=0.85)
-
+    # Update left only to 0.85
+    client.set_target(dev_id=1, target=0.85)
     assert len(transport.sent_lines) == 2
-    msg_r = json.loads(transport.sent_lines[0])
-    msg_l = json.loads(transport.sent_lines[1])
 
-    assert msg_r["type"] == "set_target"
-    assert msg_r["id"] == 0
-    assert math.isclose(msg_r["target"], 0.25, abs_tol=1e-3)
+    msg2 = json.loads(transport.sent_lines[1])
+    assert "id" not in msg2
+    assert len(msg2["target"]) == 2
+    # target[0] remains 0.30, target[1] changes to 0.85
+    assert math.isclose(msg2["target"][0], 0.30, abs_tol=1e-3)
+    assert math.isclose(msg2["target"][1], 0.85, abs_tol=1e-3)
 
-    assert msg_l["type"] == "set_target"
-    assert msg_l["id"] == 1
-    assert math.isclose(msg_l["target"], 0.85, abs_tol=1e-3)
+
+# 4. Right trigger update modifies target[0] only
+def test_04_right_trigger_modifies_target_0_only():
+    """Verify updating right gripper (ID 0) preserves target[1] and only changes target[0]."""
+    transport = MockCommandTransport()
+    client = GripperCommandClient(transport=transport)
+    client.connect()
+
+    # Initial state: right=0.20, left=0.60
+    client.set_targets(0.20, 0.60)
+    assert len(transport.sent_lines) == 1
+
+    # Update right only to 0.90
+    client.set_target(dev_id=0, target=0.90)
+    assert len(transport.sent_lines) == 2
+
+    msg2 = json.loads(transport.sent_lines[1])
+    assert "id" not in msg2
+    assert len(msg2["target"]) == 2
+    # target[0] changes to 0.90, target[1] remains 0.60
+    assert math.isclose(msg2["target"][0], 0.90, abs_tol=1e-3)
+    assert math.isclose(msg2["target"][1], 0.60, abs_tol=1e-3)
 
 
 # 5. Value validation and clamping
 def test_05_target_value_validation_and_clamping():
     """Verify validation: clamps [0.0, 1.0], rejects non-finite / invalid types."""
-    # Test clamping above 1.0
-    val_over = GripperCommandClient.validate_target(1.25)
-    assert val_over == 1.0
+    assert GripperCommandClient.validate_target(1.25) == 1.0
+    assert GripperCommandClient.validate_target(-0.15) == 0.0
 
-    # Test clamping below 0.0
-    val_under = GripperCommandClient.validate_target(-0.15)
-    assert val_under == 0.0
-
-    # Test NaN rejection
+    # NaN
     try:
         GripperCommandClient.validate_target(float("nan"))
         assert False, "Should have raised GripperCommandValidationError on NaN"
     except GripperCommandValidationError:
         pass
 
-    # Test Inf rejection
+    # Inf
     try:
         GripperCommandClient.validate_target(float("inf"))
         assert False, "Should have raised GripperCommandValidationError on Inf"
     except GripperCommandValidationError:
         pass
 
-    # Test boolean rejection (bool is a subclass of int in Python)
+    # Bool
     try:
         GripperCommandClient.validate_target(True)
         assert False, "Should have raised GripperCommandValidationError on bool"
+    except GripperCommandValidationError:
+        pass
+
+    # Invalid ID in set_target
+    transport = MockCommandTransport()
+    client = GripperCommandClient(transport=transport)
+    try:
+        client.set_target(2, 0.5)
+        assert False, "Should have raised GripperCommandValidationError on invalid dev_id"
     except GripperCommandValidationError:
         pass
 
@@ -182,17 +199,16 @@ def test_06_connection_failure_safe_handling():
 
     assert client.initialize(verbose=False) is False
     try:
-        client.set_target(1, 0.5)
+        client.set_targets(0.5, 0.5)
         assert False, "Should have raised connection error"
     except (GripperCommandConnectionError, ConnectionRefusedError):
         pass
 
-    # Safe close
     client.close()
     assert transport.is_closed is True
 
 
-# 7. CLI options check
+# 7. Parser options
 def test_07_parser_includes_gripper_daemon_options():
     """Verify create_parser parses --gripper-host and --gripper-port correctly."""
     parser = teleop_autohome.create_parser()
@@ -207,42 +223,153 @@ def test_07_parser_includes_gripper_daemon_options():
     assert args.model == "a"
 
 
-# 8. Concurrent compatibility with Recorder (get_state read-only)
-def test_08_concurrent_compatibility_get_state_and_set_target():
-    """Verify that get_state queries and set_target commands follow unified JSONL schema."""
-    # Teleop command
-    teleop_msg_str = GripperCommandClient.format_set_target_message(dev_id=1, target=0.45)
-    teleop_msg = json.loads(teleop_msg_str)
-    assert teleop_msg == {"type": "set_target", "id": 1, "target": 0.45}
+# 8. Strict DryRunGripper Round-Trip Test over real TCP Loopback
+class StrictDryRunServerHandler(socketserver.StreamRequestHandler):
+    """Handler enforcing strict DATA-05B protocol matching actual gripper server."""
 
-    # Recorder query
-    rec_query_str = GripperStateClient.GET_STATE_QUERY
-    rec_query = json.loads(rec_query_str)
-    assert rec_query == {"type": "get_state"}
+    def handle(self) -> None:
+        server: StrictDryRunServer = self.server  # type: ignore
+        for line in self.rfile:
+            text = line.decode("utf-8").strip()
+            if not text:
+                continue
+            data = json.loads(text)
+            msg_type = data.get("type")
 
-    # Mock server response for get_state
-    mock_server_state = {
-        "active_ids": [0, 1],
-        "target": [0.0, 0.45],
-        "position": [0.0, 0.448],
-    }
-    rec_client = GripperStateClient(expected_id=1)
-    sample = rec_client.parse_response(mock_server_state, received_mono_ns=time.monotonic_ns())
-    assert sample.expected_id == 1
-    assert sample.normalized_position == 0.448
+            if msg_type == "set_target":
+                # Strict check: actual server does not read or expect "id"
+                if "id" in data:
+                    server.protocol_violations.append(f"Server rejected message with 'id': {data}")
+                    raise ValueError(f"Strict server error: 'id' field is not allowed: {data}")
+                target = data.get("target")
+                if not isinstance(target, list) or len(target) != 2:
+                    server.protocol_violations.append(f"Server rejected non-list[2] target: {target}")
+                    raise ValueError(f"Strict server error: target must be list of length 2: {data}")
+                
+                with server.lock:
+                    server.target = [float(target[0]), float(target[1])]
+                    # DryRun simulates motor position tracking target
+                    server.position = list(server.target)
+                    server.received_commands.append(data)
+                # set_target sends no response (one-way command streaming)
+
+            elif msg_type == "get_state":
+                with server.lock:
+                    resp = {
+                        "active_ids": [0, 1],
+                        "target": list(server.target),
+                        "position": list(server.position),
+                    }
+                out_bytes = (json.dumps(resp) + "\n").encode("utf-8")
+                self.wfile.write(out_bytes)
+                self.wfile.flush()
+
+            else:
+                server.protocol_violations.append(f"Unknown message type: {msg_type}")
+
+
+class StrictDryRunServer(socketserver.ThreadingTCPServer):
+    allow_reuse_address = True
+
+    def __init__(self, server_address):
+        super().__init__(server_address, StrictDryRunServerHandler)
+        self.lock = threading.Lock()
+        self.target = [0.0, 0.0]
+        self.position = [0.0, 0.0]
+        self.received_commands: List[Dict[str, Any]] = []
+        self.protocol_violations: List[str] = []
+
+
+def test_08_strict_dryrun_server_round_trip():
+    """Full round-trip test with strict DryRun server over real TCP loopback.
+    
+    Verifies:
+    - Command client connects and sends {"type": "set_target", "target": [right, left]}
+    - Zero 'id' fields sent
+    - Server accepts and updates internal target [right, left]
+    - State client reads back measured position for ID 0 (right) and ID 1 (left)
+    """
+    server = StrictDryRunServer(("127.0.0.1", 0))
+    host, port = server.server_address
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    cmd_client = None
+    state_client_left = None
+    state_client_right = None
+
+    try:
+        cmd_client = GripperCommandClient(host=host, port=port)
+        cmd_client.connect()
+
+        state_client_left = GripperStateClient(host=host, port=port, expected_id=1)
+        state_client_right = GripperStateClient(host=host, port=port, expected_id=0)
+
+        # 1. Send [0.35, 0.75]
+        cmd_client.set_targets(right_target=0.35, left_target=0.75)
+        time.sleep(0.02)
+
+        # 2. Read back states via read-only state clients
+        sample_left = state_client_left.get_state_once()
+        sample_right = state_client_right.get_state_once()
+
+        assert math.isclose(sample_right.normalized_position, 0.35, abs_tol=1e-3), (
+            f"Expected right position 0.35, got {sample_right.normalized_position}"
+        )
+        assert math.isclose(sample_left.normalized_position, 0.75, abs_tol=1e-3), (
+            f"Expected left position 0.75, got {sample_left.normalized_position}"
+        )
+
+        # 3. Update right only to 0.80 -> left should stay 0.75
+        cmd_client.set_target(dev_id=0, target=0.80)
+        time.sleep(0.02)
+
+        sample_left = state_client_left.get_state_once()
+        sample_right = state_client_right.get_state_once()
+        assert math.isclose(sample_right.normalized_position, 0.80, abs_tol=1e-3)
+        assert math.isclose(sample_left.normalized_position, 0.75, abs_tol=1e-3)
+
+        # 4. Update left only to 0.10 -> right should stay 0.80
+        cmd_client.set_target(dev_id=1, target=0.10)
+        time.sleep(0.02)
+
+        sample_left = state_client_left.get_state_once()
+        sample_right = state_client_right.get_state_once()
+        assert math.isclose(sample_right.normalized_position, 0.80, abs_tol=1e-3)
+        assert math.isclose(sample_left.normalized_position, 0.10, abs_tol=1e-3)
+
+        # 5. Check server audit: no protocol violations occurred
+        assert len(server.protocol_violations) == 0, f"Server reported violations: {server.protocol_violations}"
+        assert len(server.received_commands) == 3
+
+        for cmd in server.received_commands:
+            assert cmd["type"] == "set_target"
+            assert "id" not in cmd
+            assert len(cmd["target"]) == 2
+
+    finally:
+        if cmd_client:
+            cmd_client.close()
+        if state_client_left:
+            state_client_left.close()
+        if state_client_right:
+            state_client_right.close()
+        server.shutdown()
+        server.server_close()
+        server_thread.join(timeout=1.0)
 
 
 def run_all_tests() -> int:
-    print("Running DATA-05A Teleop Gripper Daemon Migration unit tests...")
+    print("Running DATA-05B Gripper Command Client Protocol unit & integration tests...")
     test_01_zero_dynamixel_bus_opens_for_gripper()
-    test_02_left_arm_trigger_routes_to_id_1()
-    test_03_right_arm_trigger_routes_to_id_0()
-    test_04_set_targets_dual_gripper_mapping()
+    test_02_single_message_format_no_id_length_2()
+    test_03_left_trigger_modifies_target_1_only()
+    test_04_right_trigger_modifies_target_0_only()
     test_05_target_value_validation_and_clamping()
     test_06_connection_failure_safe_handling()
     test_07_parser_includes_gripper_daemon_options()
-    test_08_concurrent_compatibility_get_state_and_set_target()
-    print("All DATA-05A tests passed successfully (8/8)!")
+    test_08_strict_dryrun_server_round_trip()
+    print("All DATA-05B tests passed successfully (8/8)!")
     return 0
 
 
