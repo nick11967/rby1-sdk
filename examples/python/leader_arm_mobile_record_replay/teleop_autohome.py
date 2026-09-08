@@ -43,10 +43,11 @@ if str(EXAMPLES_DIR) not in sys.path:
 # Import drivers and settings from SDK example 35
 leader_example = importlib.import_module("35_leader_arm_teleop_with_monitor")
 LeaderArm = leader_example.LeaderArm
-Gripper = leader_example.Gripper
 READY_POSE = leader_example.READY_POSE
 Settings = leader_example.Settings
 joint_position_command_builder = leader_example.joint_position_command_builder
+
+from gripper_command_client import GripperCommandClient
 
 
 # Self-contained LeaderArm Autohome & Utility Functions
@@ -487,12 +488,11 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
         logging.info("  Left arm  (deg): %s", np.round(np.rad2deg(curr_robot_left_q), 2).tolist())
         logging.info("=" * 60)
 
-        # 4. Initialize Gripper
-        gripper = Gripper()
+        # 4. Initialize Gripper Command Client
+        logging.info("Connecting to Gripper Daemon at %s:%d...", args.gripper_host, args.gripper_port)
+        gripper = GripperCommandClient(host=args.gripper_host, port=args.gripper_port)
         if not gripper.initialize():
-            raise RuntimeError("Failed to initialize the gripper")
-        gripper.homing()
-        gripper.start()
+            raise RuntimeError(f"Failed to connect to Gripper Daemon at {args.gripper_host}:{args.gripper_port}")
 
         # 5. Initialize LeaderArm
         logging.info("Initializing LeaderArm hardware...")
@@ -618,7 +618,13 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
                 [state.button_right.trigger, state.button_left.trigger],
                 dtype=np.float64,
             ) / 1000.0
-            gripper.set_target(gripper_command)
+            try:
+                gripper.set_targets(
+                    right_target=gripper_command[0],
+                    left_target=gripper_command[1],
+                )
+            except Exception as exc:
+                logging.warning("Failed to send gripper command to daemon: %s", exc)
 
             ma_input = LeaderArm.ControlInput()
             torque = (
@@ -1011,6 +1017,18 @@ def create_parser(description: str = __doc__) -> argparse.ArgumentParser:
         "--keyboard-debug",
         action="store_true",
         help="Print raw terminal bytes to diagnose keyboard input",
+    )
+    # Gripper Arguments
+    parser.add_argument(
+        "--gripper-host",
+        default="127.0.0.1",
+        help="Gripper daemon host (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--gripper-port",
+        type=int,
+        default=8888,
+        help="Gripper daemon port (default: 8888)",
     )
     # Auto-Homing Arguments
     parser.add_argument(
