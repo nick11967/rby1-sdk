@@ -57,6 +57,17 @@ def _read_bgr(cv2, group, index: int) -> np.ndarray:
     return np.ascontiguousarray(frame_rgb[:, :, ::-1])
 
 
+def _get_camera_roles(h5) -> list[str]:
+    if "cameras" not in h5:
+        return []
+    cam_keys = set(h5["cameras"].keys())
+    preferred = [r for r in ("right_wrist", "head", "left_wrist") if r in cam_keys]
+    for k in sorted(cam_keys):
+        if k not in preferred:
+            preferred.append(k)
+    return preferred
+
+
 def _make_panel(
     cv2,
     frame_bgr: np.ndarray,
@@ -163,9 +174,12 @@ def main() -> int:
     output.parent.mkdir(parents=True, exist_ok=True)
 
     with h5py.File(recording, "r") as h5:
+        camera_roles = _get_camera_roles(h5)
+        if not camera_roles:
+            raise ValueError("camera recording contains no camera groups in 'cameras/'")
         datasets = {
             role: _image_dataset(h5[f"cameras/{role}"])[1]
-            for role in CAMERA_ROLES
+            for role in camera_roles
         }
         counts = {role: len(dataset) for role, dataset in datasets.items()}
         if len(set(counts.values())) != 1:
@@ -191,7 +205,7 @@ def main() -> int:
         output_fps = args.fps if args.fps is not None else measured_fps
 
         image_height = int(round(args.panel_width * 3.0 / 4.0))
-        video_size = (args.panel_width * 3, image_height + 40)
+        video_size = (args.panel_width * len(camera_roles), image_height + 40)
         video = cv2.VideoWriter(
             str(output),
             cv2.VideoWriter_fourcc(*args.codec),
@@ -207,6 +221,7 @@ def main() -> int:
             f"source: {recording}\n"
             f"frames: {frame_count}, recorded duration: {duration_s:.3f}s, "
             f"output FPS: {output_fps:.3f}\n"
+            f"cameras: {', '.join(camera_roles)}\n"
             f"video: {video_size[0]}x{video_size[1]}, codec: {args.codec}"
         )
         progress_interval = max(1, frame_count // 10)
@@ -217,7 +232,7 @@ def main() -> int:
             ):
                 elapsed_s = (int(timestamps[output_index]) - first_timestamp) / 1e9
                 panels = []
-                for role in CAMERA_ROLES:
+                for role in camera_roles:
                     frame = _read_bgr(
                         cv2, h5[f"cameras/{role}"], source_index
                     )

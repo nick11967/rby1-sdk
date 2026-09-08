@@ -311,3 +311,22 @@ def test_12_offline_execution_zero_hardware_calls():
     _ = reader.get_left_wrist_frame()
     assert reader.real_hardware_calls == 0
     assert reader.right_wrist_reads == 0
+
+
+def test_13_inspect_and_export_cameras_support_two_camera_profile():
+    import export_camera_video
+    import inspect_cameras
+
+    with tempfile.NamedTemporaryFile(suffix=".cameras.h5") as f:
+        with h5py.File(f.name, "w") as h5:
+            cam_grp = h5.create_group("cameras")
+            cam_grp.create_group("head")
+            cam_grp.create_group("left_wrist")
+
+        with h5py.File(f.name, "r") as h5:
+            inspect_roles = inspect_cameras._get_camera_roles(h5)
+            export_roles = export_camera_video._get_camera_roles(h5)
+
+        assert inspect_roles == ["head", "left_wrist"]
+        assert export_roles == ["head", "left_wrist"]
+

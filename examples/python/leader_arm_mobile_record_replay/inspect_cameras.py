@@ -56,6 +56,17 @@ def _frame_count(h5, role: str) -> int:
     raise ValueError(f"camera group {role!r} has no supported image dataset")
 
 
+def _get_camera_roles(h5) -> list[str]:
+    if "cameras" not in h5:
+        return []
+    cam_keys = set(h5["cameras"].keys())
+    preferred = [r for r in ("right_wrist", "head", "left_wrist") if r in cam_keys]
+    for k in sorted(cam_keys):
+        if k not in preferred:
+            preferred.append(k)
+    return preferred
+
+
 def _default_contact_sheet(recording: Path) -> Path:
     suffix = ".cameras.h5"
     if recording.name.endswith(suffix):
@@ -120,7 +131,10 @@ def main() -> int:
         parser.error(f"recording not found: {recording}")
 
     with h5py.File(recording, "r") as h5:
-        counts = {role: _frame_count(h5, role) for role in CAMERA_ROLES}
+        camera_roles = _get_camera_roles(h5)
+        if not camera_roles:
+            raise ValueError("camera recording contains no camera groups in 'cameras/'")
+        counts = {role: _frame_count(h5, role) for role in camera_roles}
         if len(set(counts.values())) != 1:
             raise ValueError(f"camera frame counts do not match: {counts}")
         count = next(iter(counts.values()))
@@ -141,15 +155,17 @@ def main() -> int:
         meta = h5["meta"].attrs
         storage = str(meta.get("storage_format", "raw"))
         zed_shm_mode = str(meta.get("zed_shm_mode", "legacy/unknown"))
+        collection_profile = str(meta.get("collection_profile", "unknown"))
         print(f"file: {recording}")
         print(
             f"frames: {count}, duration: {duration_s:.3f}s, "
             f"effective rate: {effective_hz:.2f} Hz, storage: {storage}, "
-            f"ZED SHM mode: {zed_shm_mode}"
+            f"ZED SHM mode: {zed_shm_mode}, profile: {collection_profile}"
         )
+        print(f"cameras: {', '.join(camera_roles)}")
 
         frames_rgb = {}
-        for role in CAMERA_ROLES:
+        for role in camera_roles:
             frame = _read_rgb(cv2, h5, role, index)
             frames_rgb[role] = frame
             print(
@@ -165,7 +181,7 @@ def main() -> int:
     )
     output.parent.mkdir(parents=True, exist_ok=True)
     contact_sheet = np.hstack(
-        [_make_panel(cv2, frames_rgb[role], role) for role in CAMERA_ROLES]
+        [_make_panel(cv2, frames_rgb[role], role) for role in camera_roles]
     )
     if not cv2.imwrite(str(output), contact_sheet):
         raise RuntimeError(f"failed to write {output}")
