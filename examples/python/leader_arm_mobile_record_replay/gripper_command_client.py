@@ -18,6 +18,7 @@ from dataclasses import dataclass
 import json
 import logging
 import math
+import select
 import socket
 import sys
 import threading
@@ -60,6 +61,23 @@ class SocketCommandTransport:
         self._sock: Optional[socket.socket] = None
         self._wfile = None
         self._lock = threading.Lock()
+        self._stop_drain = threading.Event()
+        self._drain_thread: Optional[threading.Thread] = None
+
+    def _drain_loop(self) -> None:
+        """Continuously drain responses broadcast by the server to prevent socket buffer bloat."""
+        while not self._stop_drain.is_set():
+            sock = self._sock
+            if sock is None:
+                break
+            try:
+                r, _, _ = select.select([sock], [], [], 0.2)
+                if r:
+                    chunk = sock.recv(4096)
+                    if not chunk:
+                        break
+            except Exception:
+                break
 
     def connect(self) -> None:
         with self._lock:
@@ -70,6 +88,11 @@ class SocketCommandTransport:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 self._sock = sock
                 self._wfile = sock.makefile("w", encoding="utf-8")
+                self._stop_drain.clear()
+                self._drain_thread = threading.Thread(
+                    target=self._drain_loop, daemon=True, name="gripper-transport-drain"
+                )
+                self._drain_thread.start()
             except Exception as exc:
                 self._close_locked()
                 raise GripperCommandConnectionError(
@@ -95,6 +118,7 @@ class SocketCommandTransport:
             return self._sock is not None and self._wfile is not None
 
     def _close_locked(self) -> None:
+        self._stop_drain.set()
         if self._wfile is not None:
             try:
                 self._wfile.close()
@@ -102,6 +126,10 @@ class SocketCommandTransport:
                 pass
             self._wfile = None
         if self._sock is not None:
+            try:
+                self._sock.shutdown(socket.SHUT_RDWR)
+            except Exception:
+                pass
             try:
                 self._sock.close()
             except Exception:
@@ -140,6 +168,8 @@ class GripperCommandClient:
             self.RIGHT_GRIPPER_ID: 0.0,
             self.LEFT_GRIPPER_ID: 0.0,
         }
+        self._last_sent_targets: Optional[Tuple[float, float]] = None
+        self._last_send_time: float = 0.0
 
     def connect(self) -> None:
         """Establish connection to the gripper daemon."""
@@ -180,15 +210,42 @@ class GripperCommandClient:
             "target": [round(valid_right, 4), round(valid_left, 4)],
         })
 
-    def set_targets(self, right_target: float, left_target: float) -> None:
-        """Send target commands for both right (ID 0) and left (ID 1) grippers in a single message."""
-        msg = self.format_set_targets_message(right_target, left_target)
+    def set_targets(
+        self,
+        right_target: float,
+        left_target: float,
+        min_delta: float = 0.0,
+        force_heartbeat_s: float = 0.0,
+    ) -> bool:
+        """Send target commands for both right (ID 0) and left (ID 1) grippers in a single message.
+
+        If min_delta > 0, skips sending if neither target changed by at least min_delta,
+        unless force_heartbeat_s elapsed since last transmission.
+        Returns True if a message was sent, False if skipped.
+        """
+        valid_right = GripperCommandClient.validate_target(right_target)
+        valid_left = GripperCommandClient.validate_target(left_target)
+        now = time.monotonic()
         with self._lock:
+            if min_delta > 0 and self._last_sent_targets is not None:
+                last_r, last_l = self._last_sent_targets
+                delta = max(abs(valid_right - last_r), abs(valid_left - last_l))
+                heartbeat_due = force_heartbeat_s > 0 and (now - self._last_send_time >= force_heartbeat_s)
+                if delta < min_delta and not heartbeat_due:
+                    return False
+
+            msg = json.dumps({
+                "type": "set_target",
+                "target": [round(valid_right, 4), round(valid_left, 4)],
+            })
             if not self.is_connected():
                 self.connect()
             self.transport.send_line(msg)
-            self._current_targets[self.RIGHT_GRIPPER_ID] = GripperCommandClient.validate_target(right_target)
-            self._current_targets[self.LEFT_GRIPPER_ID] = GripperCommandClient.validate_target(left_target)
+            self._current_targets[self.RIGHT_GRIPPER_ID] = valid_right
+            self._current_targets[self.LEFT_GRIPPER_ID] = valid_left
+            self._last_sent_targets = (valid_right, valid_left)
+            self._last_send_time = now
+            return True
 
     def set_target(self, dev_id: int, target: float) -> None:
         """Update target for one gripper ID and send full [right, left] message without 'id' field."""

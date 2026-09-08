@@ -520,6 +520,12 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
                 f"expected {leader_arm.DEVICE_COUNT}, got {len(leader_arm.active_ids)}"
             )
 
+        # Set robust holding torque limits and stiff PID gains on LeaderArm
+        base_ma_torques = np.array([4.5, 4.5, 4.5, 3.5, 2.0, 2.0, 2.0] * 2, dtype=np.float64)
+        leader_arm.MAXIMUM_TORQUE = base_ma_torques.copy()
+        for dev_id in range(NUM_LEADER_MOTORS):
+            leader_arm.bus.set_position_pid_gain(dev_id, p_gain=HOMING_PID_P, i_gain=HOMING_PID_I, d_gain=HOMING_PID_D)
+
         # 6. LeaderArm Auto-Homing to Robot's Current Pose
         if not args.skip_autohome:
             logging.info("=" * 60)
@@ -597,8 +603,9 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
         ma_max_q = np.deg2rad(
             [360, -10, 90, -60, 90, 80, 360, 360, 30, 0, -60, 90, 80, 360]
         )
-        # Holding torque in teleop mode: boosted elbow to 3.0 Nm to prevent gravity sag when idle
-        ma_torque_limit = np.array([4.0, 4.0, 4.0, 3.0, 2.0, 2.0, 2.0] * 2, dtype=np.float64)
+        # Holding torque in teleop mode: boosted shoulder (4.5 Nm) & elbow (3.5 Nm) to prevent gravity sag when idle
+        ma_torque_limit = np.array([4.5, 4.5, 4.5, 3.5, 2.0, 2.0, 2.0] * 2, dtype=np.float64)
+        leader_arm.MAXIMUM_TORQUE = ma_torque_limit.copy()
         ma_viscous_gain = np.array(
             [0.02, 0.02, 0.02, 0.02, 0.01, 0.01, 0.002] * 2
         )
@@ -608,6 +615,8 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
         last_reported_base_command = np.full(3, np.nan, dtype=np.float64)
         last_mobile_send_time = 0.0
         last_mobile_state_log_time = 0.0
+        last_arm_send_time = time.monotonic()
+        last_teleop_status_log_time = 0.0
 
         with state_lock:
             mobility_ready = robot_is_ready[model.mobility_idx].copy()
@@ -645,6 +654,7 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
             nonlocal last_collision_log_time
             nonlocal last_reported_base_command
             nonlocal last_mobile_send_time, last_mobile_state_log_time
+            nonlocal last_arm_send_time, last_teleop_status_log_time
             nonlocal arm_stream, mobility_stream
 
             if stop_event.is_set():
@@ -654,14 +664,21 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
             if left_q is None:
                 left_q = state.q_joint[7:14].copy()
 
-            gripper_command = np.array(
+            raw_triggers = np.array(
                 [state.button_right.trigger, state.button_left.trigger],
                 dtype=np.float64,
             ) / 1000.0
+            if args.invert_gripper:
+                gripper_command = np.clip(1.0 - raw_triggers, 0.0, 1.0)
+            else:
+                gripper_command = np.clip(raw_triggers, 0.0, 1.0)
+
             try:
                 gripper.set_targets(
                     right_target=gripper_command[0],
                     left_target=gripper_command[1],
+                    min_delta=0.005,
+                    force_heartbeat_s=0.1,
                 )
             except Exception as exc:
                 logging.warning("Failed to send gripper command to daemon: %s", exc)
@@ -811,22 +828,91 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
 
             base_command = keyboard.get_command()
             teleop_publisher.publish(gripper_command, base_command, state.q_joint)
-            if has_body_command:
+
+            now = time.monotonic()
+            arm_idle_refresh = (not has_body_command) and (now - last_arm_send_time >= 0.5)
+            if has_body_command or arm_idle_refresh:
                 try:
                     if arm_stream is None or arm_stream.is_done():
                         arm_stream = robot.create_command_stream(priority=args.priority)
+
+                    if has_body_command:
+                        active_body = body_builder
+                    else:
+                        idle_body = rby.BodyComponentBasedCommandBuilder()
+                        r_hold = (
+                            rby.JointPositionCommandBuilder()
+                            if position_mode
+                            else rby.JointImpedanceControlCommandBuilder()
+                        )
+                        (
+                            r_hold.set_command_header(
+                                rby.CommandHeaderBuilder().set_control_hold_time(1e6)
+                            )
+                            .set_position(
+                                np.clip(
+                                    right_q,
+                                    robot_min_q[model.right_arm_idx],
+                                    robot_max_q[model.right_arm_idx],
+                                )
+                            )
+                            .set_velocity_limit(robot_max_qdot[model.right_arm_idx])
+                            .set_acceleration_limit(
+                                robot_max_qddot[model.right_arm_idx] * 30
+                            )
+                            .set_minimum_time(1.0)
+                        )
+                        l_hold = (
+                            rby.JointPositionCommandBuilder()
+                            if position_mode
+                            else rby.JointImpedanceControlCommandBuilder()
+                        )
+                        (
+                            l_hold.set_command_header(
+                                rby.CommandHeaderBuilder().set_control_hold_time(1e6)
+                            )
+                            .set_position(
+                                np.clip(
+                                    left_q,
+                                    robot_min_q[model.left_arm_idx],
+                                    robot_max_q[model.left_arm_idx],
+                                )
+                            )
+                            .set_velocity_limit(robot_max_qdot[model.left_arm_idx])
+                            .set_acceleration_limit(
+                                robot_max_qddot[model.left_arm_idx] * 30
+                            )
+                            .set_minimum_time(1.0)
+                        )
+                        idle_body.set_right_arm_command(r_hold)
+                        idle_body.set_left_arm_command(l_hold)
+                        active_body = idle_body
+
                     arm_stream.send_command(
                         rby.RobotCommandBuilder().set_command(
                             rby.ComponentBasedCommandBuilder().set_body_command(
-                                body_builder
+                                active_body
                             )
                         )
                     )
+                    last_arm_send_time = now
                 except Exception as exc:
                     logging.warning("Arm stream send failed: %s", exc)
                     arm_stream = None
 
-            now = time.monotonic()
+            if now - last_teleop_status_log_time >= 0.5:
+                r_status = "TELEOP" if state.button_right.button else "HOLD"
+                l_status = "TELEOP" if state.button_left.button else "HOLD"
+                logging.info(
+                    "Teleop: R_arm=%s (trg=%4d -> grip=%.2f) | L_arm=%s (trg=%4d -> grip=%.2f)",
+                    r_status,
+                    int(state.button_right.trigger),
+                    gripper_command[0],
+                    l_status,
+                    int(state.button_left.trigger),
+                    gripper_command[1],
+                )
+                last_teleop_status_log_time = now
             command_changed = not np.array_equal(
                 base_command, last_reported_base_command
             )
@@ -907,8 +993,8 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
         keyboard.start()
         logging.info("=" * 60)
         logging.info("Teleoperation Ready & Synchronized!")
-        logging.info("Leader Arm: Hold Right/Left trigger button to move arm")
-        logging.info("Gripper: Squeeze trigger to close gripper")
+        logging.info("Leader Arm: Hold Right/Left handle button to move arm")
+        logging.info("Gripper: Squeeze trigger to close gripper (release to open)")
         logging.info("Mobile Base: ↑/W forward, ↓/S backward, ←/A left, →/D right")
         logging.info("Press Space to stop base; press Q or Ctrl+C to exit")
         logging.info("=" * 60)
@@ -950,16 +1036,27 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
         # 3. Stop mobility base
         _send_base_stop(mobility_stream, args)
 
-        # 4. Gracefully ramp down LeaderArm torques to prevent sudden drop
+        # 4. Gracefully ramp down LeaderArm torques to prevent sudden drop or snapping
         if leader_arm is not None:
             try:
                 logging.info("Gently ramping down LeaderArm motor torques (1.2 s)...")
                 leader_arm.stop_control(torque_disable=False)
                 motor_ids = list(range(14))
+                # Lock present joint positions as targets to prevent snapping back to an older pose
+                try:
+                    q_curr = read_joint_positions(leader_arm.bus, motor_ids)
+                    leader_arm.bus.group_sync_write_send_position(
+                        [(i, float(q_curr[i])) for i in motor_ids]
+                    )
+                except Exception as q_exc:
+                    logging.debug("Could not lock current pose before ramp down: %s", q_exc)
+
                 steps = 24
-                default_torque_limits = np.array([3.5, 3.5, 3.5, 2.5, 1.5, 1.5, 1.5] * 2, dtype=np.float64)
+                default_torque_limits = np.array([4.5, 4.5, 4.5, 3.5, 2.0, 2.0, 2.0] * 2, dtype=np.float64)
                 for alpha in np.linspace(1.0, 0.0, steps):
-                    leader_arm.bus.group_sync_write_send_torque([(i, default_torque_limits[i] * alpha) for i in motor_ids])
+                    leader_arm.bus.group_sync_write_send_torque(
+                        [(i, float(default_torque_limits[i] * alpha)) for i in motor_ids]
+                    )
                     time.sleep(1.2 / steps)
                 leader_arm.DisableTorque()
                 logging.info("LeaderArm torques safely released.")
@@ -1083,6 +1180,19 @@ def create_parser(description: str = __doc__) -> argparse.ArgumentParser:
         type=int,
         default=8888,
         help="Gripper daemon port (default: 8888)",
+    )
+    parser.add_argument(
+        "--invert-gripper",
+        dest="invert_gripper",
+        action="store_true",
+        default=True,
+        help="Invert gripper triggers so squeezing trigger closes gripper (default: True)",
+    )
+    parser.add_argument(
+        "--no-invert-gripper",
+        dest="invert_gripper",
+        action="store_false",
+        help="Do not invert gripper triggers (raw: released=0.0, squeezed=1.0)",
     )
     # Auto-Homing Arguments
     parser.add_argument(
