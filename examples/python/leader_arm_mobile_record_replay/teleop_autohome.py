@@ -496,7 +496,15 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
             right_arm=curr_robot_right_q,
             left_arm=curr_robot_left_q,
         )
+        left_arm_2_offset_rad = float(np.deg2rad(args.left_arm_2_offset_deg))
         target_leader_q = np.concatenate([curr_robot_right_q, curr_robot_left_q])
+        if abs(left_arm_2_offset_rad) > 1e-6:
+            target_leader_q[9] -= left_arm_2_offset_rad
+            logging.info(
+                "Applied left_arm_2 offset to LeaderArm target: %+.2f deg (%+.4f rad)",
+                args.left_arm_2_offset_deg,
+                left_arm_2_offset_rad,
+            )
 
         logging.info("=" * 60)
         logging.info("Robot starting pose detected:")
@@ -596,12 +604,12 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
         if record_path is not None:
             recorder = TrajectoryRecorder(record_path, model)
 
-        ma_q_limit_barrier = 0.5
+        ma_q_limit_barrier = args.ma_q_limit_barrier
         ma_min_q = np.deg2rad(
-            [-360, -30, 0, -135, -90, 35, -360, -360, 10, -90, -135, -90, 35, -360]
+            [-180, -60, -90, -150, -180, -90, -180, -180, 10, -90, -150, -180, -90, -180]
         )
         ma_max_q = np.deg2rad(
-            [360, -10, 90, -60, 90, 80, 360, 360, 30, 0, -60, 90, 80, 360]
+            [180, -10, 90, 0, 180, 90, 180, 180, 60, 90, 0, 180, 90, 180]
         )
         # Holding torque in teleop mode: boosted shoulder (4.5 Nm) & elbow (3.5 Nm) to prevent gravity sag when idle
         ma_torque_limit = np.array([4.5, 4.5, 4.5, 3.5, 2.0, 2.0, 2.0] * 2, dtype=np.float64)
@@ -727,9 +735,13 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
                 q = robot_position.copy()
                 odometry = robot_odometry.copy()
 
+            left_q_to_robot = left_q.copy()
+            if abs(left_arm_2_offset_rad) > 1e-6:
+                left_q_to_robot[2] += left_arm_2_offset_rad
+
             q_for_collision = q.copy()
             q_for_collision[model.right_arm_idx] = right_q
-            q_for_collision[model.left_arm_idx] = left_q
+            q_for_collision[model.left_arm_idx] = left_q_to_robot
             dyn_state.set_q(q_for_collision)
             dyn_model.compute_forward_kinematics(dyn_state)
             nearest = dyn_model.detect_collisions_or_nearest_links(dyn_state, 1)[0]
@@ -802,7 +814,7 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
                     )
                     .set_position(
                         np.clip(
-                            left_q,
+                            left_q_to_robot,
                             robot_min_q[model.left_arm_idx],
                             robot_max_q[model.left_arm_idx],
                         )
@@ -873,7 +885,7 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
                             )
                             .set_position(
                                 np.clip(
-                                    left_q,
+                                    left_q_to_robot,
                                     robot_min_q[model.left_arm_idx],
                                     robot_max_q[model.left_arm_idx],
                                 )
@@ -903,13 +915,35 @@ def run(args: argparse.Namespace, record_path: Optional[Path] = None) -> int:
             if now - last_teleop_status_log_time >= 0.5:
                 r_status = "TELEOP" if state.button_right.button else "HOLD"
                 l_status = "TELEOP" if state.button_left.button else "HOLD"
+                r_j2_leader = float(np.rad2deg(state.q_joint[2]))
+                l_j2_leader = float(np.rad2deg(state.q_joint[9]))
+                with state_lock:
+                    r_j2_robot = (
+                        float(np.rad2deg(robot_position[model.right_arm_idx[2]]))
+                        if robot_position is not None
+                        else 0.0
+                    )
+                    l_j2_robot = (
+                        float(np.rad2deg(robot_position[model.left_arm_idx[2]]))
+                        if robot_position is not None
+                        else 0.0
+                    )
+                if abs(args.left_arm_2_offset_deg) > 1e-3:
+                    l_j2_cmd = l_j2_leader + args.left_arm_2_offset_deg
+                    l_j2_str = f"ldr={l_j2_leader:+5.1f}° cmd={l_j2_cmd:+5.1f}° rob={l_j2_robot:+5.1f}°"
+                else:
+                    l_j2_str = f"ldr={l_j2_leader:+5.1f}° rob={l_j2_robot:+5.1f}°"
+
                 logging.info(
-                    "Teleop: R_arm=%s (trg=%4d -> grip=%.2f) | L_arm=%s (trg=%4d -> grip=%.2f)",
+                    "Teleop: R=%s (j2: ldr=%+5.1f° rob=%+5.1f° trg=%4d) | L=%s (j2: %s trg=%4d) | Grip=[%.2f, %.2f]",
                     r_status,
+                    r_j2_leader,
+                    r_j2_robot,
                     int(state.button_right.trigger),
-                    gripper_command[0],
                     l_status,
+                    l_j2_str,
                     int(state.button_left.trigger),
+                    gripper_command[0],
                     gripper_command[1],
                 )
                 last_teleop_status_log_time = now
@@ -1222,6 +1256,19 @@ def create_parser(description: str = __doc__) -> argparse.ArgumentParser:
         "--skip-autohome",
         action="store_true",
         help="Skip leader-arm auto-homing step before starting teleoperation",
+    )
+    # Joint Limit and Calibration Offset Arguments
+    parser.add_argument(
+        "--left-arm-2-offset-deg",
+        type=float,
+        default=0.0,
+        help="Offset angle in degrees applied to left_arm_2 (positive shifts outward/clockwise, default: 0.0)",
+    )
+    parser.add_argument(
+        "--ma-q-limit-barrier",
+        type=float,
+        default=0.0,
+        help="Leader-arm joint limit barrier gain (default: 0.0, disabled matching SDK example 35)",
     )
     # Camera arguments
     parser.add_argument(

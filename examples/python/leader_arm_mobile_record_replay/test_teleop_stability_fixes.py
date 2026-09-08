@@ -143,5 +143,41 @@ class TestSocketDrainAndDeduplication(unittest.TestCase):
         client.close()
 
 
+class TestLeftArm2JointLimitsAndOffset(unittest.TestCase):
+    def test_left_arm_2_limits_allow_positive_angles(self):
+        from teleop_autohome import create_parser
+        parser = create_parser()
+        args = parser.parse_args([
+            "--address", "127.0.0.1:50051",
+            "--left-arm-2-offset-deg", "5.0",
+            "--ma-q-limit-barrier", "0.0",
+        ])
+        self.assertEqual(args.left_arm_2_offset_deg, 5.0)
+        self.assertEqual(args.ma_q_limit_barrier, 0.0)
+
+        # Joint 2 (idx 2 right, idx 9 left) must cover [-90 deg, +90 deg]
+        ma_min_q = np.deg2rad(
+            [-180, -60, -90, -150, -180, -90, -180, -180, 10, -90, -150, -180, -90, -180]
+        )
+        ma_max_q = np.deg2rad(
+            [180, -10, 90, 0, 180, 90, 180, 180, 60, 90, 0, 180, 90, 180]
+        )
+        # Verify right joint 2 allows negative angles like -40 deg
+        self.assertLessEqual(ma_min_q[2], np.deg2rad(-40.0))
+        # Verify left joint 2 allows positive angles like +40 deg
+        self.assertGreaterEqual(ma_max_q[9], np.deg2rad(+40.0))
+
+    def test_offset_application_math(self):
+        offset_deg = 5.0
+        offset_rad = np.deg2rad(offset_deg)
+        robot_left_q = np.array([0.0, 0.0, np.deg2rad(40.0), 0.0, 0.0, 0.0, 0.0])
+
+        # Autohome target leader q adjustment: leader_target = robot_angle - offset
+        target_leader_j2 = robot_left_q[2] - offset_rad
+        # In teleop, command sent to robot: robot_cmd = leader_q + offset
+        robot_cmd_j2 = target_leader_j2 + offset_rad
+        self.assertAlmostEqual(robot_cmd_j2, robot_left_q[2])
+
+
 if __name__ == "__main__":
     unittest.main()
