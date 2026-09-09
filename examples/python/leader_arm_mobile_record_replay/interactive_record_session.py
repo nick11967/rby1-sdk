@@ -3,13 +3,15 @@
 
 Seamlessly integrates:
 1. One-shot auto-reset via sample_and_move_to_ready.py (isolated venv subprocess)
-2. Smooth LeaderArm Auto-Homing to the perturbed ready pose
+2. Smooth LeaderArm Auto-Homing to the perturbed ready pose (-40 deg joint 2 offset calibrated)
 3. Long-lived Teleoperation and Multi-Camera recording session (zero restart latency)
-4. Terminal interactive state machine:
+4. Daemon-based Gripper control & 30 Hz state sampling (DATA-05A/B)
+5. Complete DATA-04B observation set (Left Arm 7D + Left Gripper 1D + 8D observation in NPZ)
+6. Terminal interactive state machine:
      [s] : Start recording current episode (kinematics NPZ + camera H5)
-     [e] : Stop recording -> save episode -> auto-release gripper
-     [c] : Continue to next episode (auto-reset -> auto-home -> standby)
-     [d] : Discard current/recent episode
+     [e] : Stop recording -> save episode -> auto-open gripper
+     [r] : Next episode -> Auto-reset to random ready pose -> Auto-home LeaderArm -> Standby
+     [x] : Discard current recording (or delete saved episode)
      [q] : Safe shutdown (LeaderArm torque ramp-down)
 """
 
@@ -19,6 +21,7 @@ import argparse
 from datetime import datetime
 import importlib
 import logging
+import math
 import os
 from pathlib import Path
 import queue
@@ -37,14 +40,22 @@ import rby1_sdk as rby
 
 from camera_io import (
     CameraSessionProcess,
+    COLLECTION_PROFILES,
     DEFAULT_CAMERA_PYTHON,
     DEFAULT_CAMERA_STACK_ROOT,
+    DEFAULT_COLLECTION_PROFILE,
     DEFAULT_ZED_RECORD_PROFILE,
     ZED_RECORD_PROFILES,
     ZED_SHM_MODES,
     camera_sidecar_path,
     TeleopStatePublisher,
 )
+from gripper_command_client import GripperCommandClient
+from gripper_state_client import (
+    GripperStateClient,
+    GripperStateSampler,
+)
+from record_episodes import EpisodeBuffer, check_camera_shm_status, find_next_episode_idx
 
 EXAMPLES_DIR = Path(__file__).resolve().parent.parent
 if str(EXAMPLES_DIR) not in sys.path:
@@ -53,39 +64,36 @@ if str(EXAMPLES_DIR) not in sys.path:
 # Import drivers and settings from SDK example 35
 leader_example = importlib.import_module("35_leader_arm_teleop_with_monitor")
 LeaderArm = leader_example.LeaderArm
-Gripper = leader_example.Gripper
 Settings = leader_example.Settings
 joint_position_command_builder = leader_example.joint_position_command_builder
 
-# Teleoperation and record session constants
+DEFAULT_RESET_PYTHON = Path("/home/nvidia/arpa_h_demo_robot_side/.venv/bin/python")
+DEFAULT_RESET_SCRIPT = Path("/home/nvidia/arpa_h_demo_robot_side/sample_and_move_to_ready.py")
+NUM_LEADER_MOTORS = 14
+HOMING_PID_P = 800
+HOMING_PID_I = 0
+HOMING_PID_D = 40
 
-DEFAULT_RESET_PYTHON = Path.home() / "arpa_h_demo_robot_side" / ".venv" / "bin" / "python"
-DEFAULT_RESET_SCRIPT = Path.home() / "arpa_h_demo_robot_side" / "sample_and_move_to_ready.py"
+
+def read_joint_positions(bus: rby.DynamixelBus, motor_ids: list[int] = list(range(NUM_LEADER_MOTORS))) -> np.ndarray:
+    """Read present positions from Dynamixel bus."""
+    ms_list = bus.get_motor_states(motor_ids)
+    if not ms_list:
+        raise RuntimeError("Failed to read leader arm joint positions")
+    sorted_states = sorted(ms_list, key=lambda x: x[0])
+    return np.array([mstate.position for _, mstate in sorted_states], dtype=np.float64)
 
 
-def find_next_episode_idx(output_dir: Path, prefix: str) -> int:
-    """Find the next unused episode index in output_dir."""
-    if not output_dir.exists():
-        return 0
-    existing = list(output_dir.glob(f"{prefix}_*"))
-    max_idx = -1
-    for p in existing:
-        name = p.name
-        if not name.startswith(f"{prefix}_"):
-            continue
-        try:
-            suffix_part = name[len(prefix) + 1 :]
-            idx_str = suffix_part.split(".")[0]
-            idx = int(idx_str)
-            if idx > max_idx:
-                max_idx = idx
-        except (ValueError, IndexError):
-            pass
-    return max_idx + 1
+def s_curve_quintic(t: float, duration: float) -> float:
+    """Evaluate quintic S-curve polynomial s(t) from 0 to 1 over duration."""
+    if duration <= 0:
+        return 1.0
+    tau = np.clip(t / duration, 0.0, 1.0)
+    return float(10.0 * tau**3 - 15.0 * tau**4 + 6.0 * tau**5)
 
 
 class UnifiedTerminalController:
-    """Handles both base mobility (arrow keys) and episode FSM (s, e, c, d, q) in a single TTY listener."""
+    """Handles both base mobility (arrow keys) and episode FSM (s, e, r, x, q) in a single TTY listener."""
 
     _ARROW_DIRECTIONS = {
         b"\x1b[A": (1.0, 0.0, "FORWARD"),
@@ -122,7 +130,8 @@ class UnifiedTerminalController:
 
     def start(self) -> None:
         if not sys.stdin.isatty():
-            raise RuntimeError("Interactive session requires a TTY terminal.")
+            logging.warning("Non-interactive stdin: TTY keyboard control disabled.")
+            return
         self._fd = sys.stdin.fileno()
         self._old_termios = termios.tcgetattr(self._fd)
         tty.setcbreak(self._fd)
@@ -213,7 +222,12 @@ class UnifiedTerminalController:
                     break
                 byte_val = pending[i]
                 char = chr(byte_val).lower()
-                if char in ("s", "e", "c", "d", "q", "r"):
+                if char in ("s", "e", "r", "c", "x", "d", "q"):
+                    # Map 'c' to 'r' (continue/reset) and 'd' to 'x' (discard)
+                    if char == "c":
+                        char = "r"
+                    elif char == "d":
+                        char = "x"
                     self.key_queue.put(char)
                 i += 1
 
@@ -223,117 +237,10 @@ class UnifiedTerminalController:
                 pending = remaining
 
 
-class EpisodeTrajectoryRecorder:
-    """Collects synchronized robot state, leader positions, and commands for one episode."""
-
-    def __init__(self, model) -> None:
-        self.model_name = model.model_name
-        self.joint_names = list(model.robot_joint_names)
-        self._lock = threading.Lock()
-        self.is_recording = False
-        self.started_at_ns = 0
-        self.started_unix_ns = 0
-        self._wall_minus_monotonic_ns = 0
-
-        self._time_s: List[float] = []
-        self._monotonic_ns: List[int] = []
-        self._unix_ns: List[int] = []
-        self._position: List[np.ndarray] = []
-        self._velocity: List[np.ndarray] = []
-        self._odometry: List[np.ndarray] = []
-        self._base_command: List[np.ndarray] = []
-        self._gripper_command: List[np.ndarray] = []
-        self._leader_position: List[np.ndarray] = []
-
-    def start(self) -> None:
-        with self._lock:
-            self.started_at_ns = time.monotonic_ns()
-            self.started_unix_ns = time.time_ns()
-            self._wall_minus_monotonic_ns = self.started_unix_ns - self.started_at_ns
-            self._time_s.clear()
-            self._monotonic_ns.clear()
-            self._unix_ns.clear()
-            self._position.clear()
-            self._velocity.clear()
-            self._odometry.clear()
-            self._base_command.clear()
-            self._gripper_command.clear()
-            self._leader_position.clear()
-            self.is_recording = True
-
-    def append(
-        self,
-        robot_position: np.ndarray,
-        robot_velocity: Optional[np.ndarray],
-        odometry: np.ndarray,
-        base_command: np.ndarray,
-        gripper_command: np.ndarray,
-        leader_position: np.ndarray,
-    ) -> None:
-        if not self.is_recording:
-            return
-        now_ns = time.monotonic_ns()
-        with self._lock:
-            if not self.is_recording:
-                return
-            self._time_s.append((now_ns - self.started_at_ns) / 1e9)
-            self._monotonic_ns.append(now_ns)
-            self._unix_ns.append(now_ns + self._wall_minus_monotonic_ns)
-            self._position.append(robot_position.copy())
-            if robot_velocity is not None:
-                self._velocity.append(robot_velocity.copy())
-            self._odometry.append(odometry.copy())
-            self._base_command.append(base_command.copy())
-            self._gripper_command.append(gripper_command.copy())
-            self._leader_position.append(leader_position.copy())
-
-    def stop_and_save(self, output_path: Path) -> int:
-        with self._lock:
-            self.is_recording = False
-            count = len(self._time_s)
-            if count == 0:
-                logging.warning("No samples collected; file not saved.")
-                return 0
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            kwargs = {
-                "schema_version": np.array(2, dtype=np.int64),
-                "model_name": np.array(self.model_name),
-                "joint_names": np.asarray(self.joint_names),
-                "started_monotonic_ns": np.array(self.started_at_ns, dtype=np.uint64),
-                "started_unix_ns": np.array(self.started_unix_ns, dtype=np.uint64),
-                "time_s": np.asarray(self._time_s, dtype=np.float64),
-                "monotonic_ns": np.asarray(self._monotonic_ns, dtype=np.uint64),
-                "unix_ns": np.asarray(self._unix_ns, dtype=np.uint64),
-                "position": np.asarray(self._position, dtype=np.float64),
-                "odometry": np.asarray(self._odometry, dtype=np.float64),
-                "base_command": np.asarray(self._base_command, dtype=np.float64),
-                "gripper_command": np.asarray(self._gripper_command, dtype=np.float64),
-                "leader_position": np.asarray(self._leader_position, dtype=np.float64),
-            }
-            if self._velocity:
-                kwargs["velocity"] = np.asarray(self._velocity, dtype=np.float64)
-
-            np.savez_compressed(output_path, **kwargs)
-            return count
-
-    def discard(self) -> None:
-        with self._lock:
-            self.is_recording = False
-            self._time_s.clear()
-            self._monotonic_ns.clear()
-            self._unix_ns.clear()
-            self._position.clear()
-            self._velocity.clear()
-            self._odometry.clear()
-            self._base_command.clear()
-            self._gripper_command.clear()
-            self._leader_position.clear()
-
-
 def execute_auto_reset(args: argparse.Namespace) -> bool:
     """Run sample_and_move_to_ready.py via subprocess with isolated venv."""
-    python_bin = Path(args.reset_python).expanduser()
-    script_path = Path(args.reset_script).expanduser()
+    python_bin = Path(args.reset_python).expanduser().resolve()
+    script_path = Path(args.reset_script).expanduser().resolve()
     if not python_bin.is_file():
         logging.error("Reset python executable not found: %s", python_bin)
         return False
@@ -351,11 +258,16 @@ def execute_auto_reset(args: argparse.Namespace) -> bool:
         "--minimum-time", str(args.reset_time),
         "--yes",
     ]
-    logging.info("[RESET] Executing: %s", " ".join(cmd))
+    if args.arm_only:
+        cmd.append("--arm-only")
+    else:
+        cmd.append("--no-arm-only")
+
+    logging.info("[RESET] Executing isolated subprocess: %s", " ".join(cmd))
     try:
-        subprocess.run(cmd, check=True)
+        subprocess.run(cmd, check=True, cwd=str(script_path.parent))
         logging.info("[RESET] Auto-reset to perturbed ready pose successful.")
-        time.sleep(0.5)  # Required safe interval for robot SDK session release
+        time.sleep(0.5)  # Required safe interval for robot gRPC session release
         return True
     except subprocess.CalledProcessError as exc:
         logging.error("[RESET] Auto-reset failed with exit code %d", exc.returncode)
@@ -365,11 +277,12 @@ def execute_auto_reset(args: argparse.Namespace) -> bool:
         return False
 
 
-def release_gripper_fully(gripper: Gripper) -> None:
+def release_gripper_fully(gripper: GripperCommandClient, invert: bool = True) -> None:
     """Command gripper to open position and wait briefly."""
-    logging.info("[GRIPPER] Auto-releasing gripper (fully open)...")
+    target = 1.0 if invert else 0.0
+    logging.info("[GRIPPER] Auto-releasing gripper (open target=%.1f)...", target)
     try:
-        gripper.set_target(np.array([0.0, 0.0], dtype=np.float64))
+        gripper.set_targets(target, target)
         time.sleep(0.3)
     except Exception as exc:
         logging.warning("[GRIPPER] Failed to release gripper: %s", exc)
@@ -389,20 +302,49 @@ def create_parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=("position", "impedance"), default="position", help="Arm control mode")
     parser.add_argument("--collision-distance", type=float, default=0.015, help="Self-collision threshold [m]")
 
-    # Auto-Reset Subprocess Arguments
+    # LeaderArm and Control Offsets
+    parser.add_argument("--left-arm-2-offset-deg", type=float, default=-40.0, help="Calibration offset in degrees for left_arm_2")
+    parser.add_argument("--ma-q-limit-barrier", type=float, default=0.0, help="Barrier stiffness for leader-arm joint limits (default: 0.0)")
+
+    # Auto-Reset Subprocess Arguments (Isolated Venv)
     parser.add_argument("--reset-python", type=Path, default=DEFAULT_RESET_PYTHON, help="Python binary for reset script")
     parser.add_argument("--reset-script", type=Path, default=DEFAULT_RESET_SCRIPT, help="sample_and_move_to_ready.py path")
     parser.add_argument("--noise-deg", type=float, default=3.0, help="Perturbation noise magnitude in degrees")
     parser.add_argument("--noise-mode", choices=("uniform", "normal"), default="uniform", help="Perturbation mode")
     parser.add_argument("--reset-time", type=float, default=4.0, help="Reset motion duration in seconds")
+    parser.add_argument("--arm-only", action=argparse.BooleanOptionalAction, default=True, help="Command only left arm during reset")
 
     # LeaderArm Auto-Homing Arguments
     parser.add_argument("--autohome-time", type=float, default=3.0, help="LeaderArm auto-homing duration [s]")
     parser.add_argument("--autohome-tolerance", type=float, default=0.05, help="Auto-homing convergence tolerance [rad]")
+    parser.add_argument("--autohome-current", type=float, default=0.8, help="Homing torque scale")
+    parser.add_argument("--skip-initial-reset", action="store_true", help="Skip the first reset on startup")
+
+    # Gripper Daemon Arguments (DATA-05A/B)
+    parser.add_argument("--gripper-host", default="127.0.0.1", help="Gripper daemon host")
+    parser.add_argument("--gripper-port", type=int, default=8888, help="Gripper daemon port")
+    parser.add_argument("--gripper-id", type=int, default=1, help="Expected left gripper ID in daemon")
+    parser.add_argument("--gripper-state-hz", type=float, default=30.0, help="Gripper state polling rate in Hz")
+    parser.add_argument("--gripper-max-age-s", type=float, default=0.2, help="Maximum allowed gripper sample age in seconds")
+    parser.add_argument(
+        "--invert-gripper",
+        dest="invert_gripper",
+        action="store_true",
+        default=True,
+        help="Invert gripper triggers so squeezing trigger closes gripper (default: True)",
+    )
+    parser.add_argument(
+        "--no-invert-gripper",
+        dest="invert_gripper",
+        action="store_false",
+        help="Do not invert gripper triggers (raw: released=0.0, squeezed=1.0)",
+    )
 
     # Episode Recording Arguments
-    parser.add_argument("--output-dir", type=Path, default=Path("recordings"), help="Output directory for episodes")
-    parser.add_argument("--prefix", default="episode", help="Episode file prefix (e.g. episode_0000.npz)")
+    parser.add_argument("--output-dir", type=Path, default=Path("/mnt/ssd/rby1_data/pick_apple_v2"), help="Output directory for episodes")
+    parser.add_argument("--prefix", default="pick_apple", help="Episode file prefix")
+    parser.add_argument("--rate", type=float, default=100.0, help="Robot state logging rate [Hz]")
+    parser.add_argument("--collection-profile", choices=tuple(COLLECTION_PROFILES.keys()), default="left-pick-minimal", help="Camera and observation profile")
 
     # Camera Recording Arguments
     parser.add_argument("--no-cameras", action="store_true", help="Disable camera recording")
@@ -446,7 +388,7 @@ def main() -> int:
     stop_event = threading.Event()
     key_queue: queue.Queue[str] = queue.Queue()
 
-    # Unified terminal controller for base mobility (arrows) & FSM action keys (s, e, c, d, q)
+    # Terminal controller for base mobility (arrows) & action keys (s, e, r, x, q)
     terminal_controller = UnifiedTerminalController(
         key_queue=key_queue,
         stop_event=stop_event,
@@ -456,26 +398,36 @@ def main() -> int:
     )
 
     robot = None
-    gripper = None
-    leader_arm = None
     arm_stream = None
+    mobility_stream = None
+    leader_arm = None
+    gripper_cmd_client = None
+    gripper_sampler = None
     camera_session: Optional[CameraSessionProcess] = None
-    current_camera_output: Optional[Path] = None
-    current_npz_output: Optional[Path] = None
 
     state_lock = threading.Lock()
     robot_position = None
     robot_velocity = None
-    robot_odometry = np.eye(3, dtype=np.float64)
+    robot_odometry = None
     robot_is_ready = None
 
-    # Teleop state variables
-    teleop_active = False
     right_q = None
     left_q = None
     right_minimum_time = 1.0
     left_minimum_time = 1.0
     last_collision_log_time = 0.0
+
+    # Mobile base state
+    last_sent_base_command = np.zeros(3, dtype=np.float64)
+    last_mobile_send_time = 0.0
+
+    # In-loop LeaderArm modes: HOLD, HOMING, TELEOP
+    leader_mode = "HOLD"
+    leader_hold_q: Optional[np.ndarray] = None
+    homing_start_q: Optional[np.ndarray] = None
+    homing_target_q: Optional[np.ndarray] = None
+    homing_start_time = 0.0
+    homing_done_event = threading.Event()
 
     def request_stop(signum=None, frame=None):
         stop_event.set()
@@ -484,17 +436,19 @@ def main() -> int:
         signal.signal(signum, request_stop)
 
     print("\n" + "=" * 70)
-    print("  RB-Y1 Interactive Multi-Episode Teleoperation & Recording Session ")
+    print("  RB-Y1 Unified Interactive Teleoperation & Data Collection Session ")
     print("=" * 70)
     print("Workflow:")
-    print("  1. Auto-Reset (sample_and_move_to_ready.py with noise)")
-    print("  2. Auto-Home LeaderArm to perturbed initial pose")
+    print("  1. Auto-Reset: sample_and_move_to_ready.py (isolated venv)")
+    print("  2. Auto-Home: LeaderArm synchronized to perturbed initial pose")
     print("  3. Teleop Ready & Standby")
-    print("  [s] : START recording episode")
+    print("Controls:")
+    print("  [s] : START recording episode (Kinematics NPZ + Cameras H5)")
     print("  [e] : STOP & SAVE episode -> Auto-open gripper")
-    print("  [c] : CONTINUE to next episode (trigger auto-reset)")
-    print("  [d] : DISCARD current/recent episode")
-    print("  [q] : QUIT session")
+    print("  [r] : RESET to new random ready pose -> Auto-home LeaderArm -> Next Episode")
+    print("  [x] : DISCARD current/recent episode")
+    print("  [q] : QUIT session safely")
+    print("  [Arrows] : Drive mobile base (Space to stop)")
     print("=" * 70 + "\n")
 
     try:
@@ -519,7 +473,7 @@ def main() -> int:
         if not robot.is_servo_on(args.servo):
             if not robot.servo_on(args.servo):
                 logging.warning(
-                    "Failed to servo on %r (wheel drives may be off), falling back to upper body: %s",
+                    "Failed to servo on %r, falling back to upper body: %s",
                     args.servo,
                     DEFAULT_SERVO_PATTERN,
                 )
@@ -537,10 +491,39 @@ def main() -> int:
             raise RuntimeError("Failed to enable control manager")
         for arm in ("right", "left"):
             robot.set_tool_flange_output_voltage(arm, 12)
-        time.sleep(1.5)  # Wait for tool flange / gripper Dynamixels to boot up
+        time.sleep(1.0)
         robot.set_parameter("joint_position_command.cutoff_frequency", "3")
 
-        # 2. Start State Update Stream (100 Hz)
+        # 2. Connect to Gripper Daemon
+        logging.info("Connecting to Gripper Daemon at %s:%d...", args.gripper_host, args.gripper_port)
+        gripper_cmd_client = GripperCommandClient(host=args.gripper_host, port=args.gripper_port)
+        if not gripper_cmd_client.initialize():
+            raise RuntimeError(f"Failed to connect to Gripper Daemon at {args.gripper_host}:{args.gripper_port}")
+
+        if args.collection_profile == "left-pick-minimal":
+            gripper_state_client = GripperStateClient(
+                host=args.gripper_host,
+                port=args.gripper_port,
+                expected_id=args.gripper_id,
+            )
+            gripper_sampler = GripperStateSampler(
+                client=gripper_state_client,
+                hz=args.gripper_state_hz,
+                max_age_s=args.gripper_max_age_s,
+            )
+            gripper_sampler.start()
+
+        # 3. Setup EpisodeBuffer for recording
+        episode_buffer = EpisodeBuffer(
+            model_name=model.model_name,
+            joint_names=list(model.robot_joint_names),
+            collection_profile=args.collection_profile,
+            left_arm_idx=list(model.left_arm_idx),
+            gripper_sampler=gripper_sampler,
+            gripper_max_age_s=args.gripper_max_age_s,
+        )
+
+        # 4. Start State Update Stream (100 Hz)
         def on_robot_state(state):
             nonlocal robot_position, robot_velocity, robot_odometry, robot_is_ready
             with state_lock:
@@ -548,72 +531,73 @@ def main() -> int:
                 robot_velocity = state.velocity.copy()
                 robot_odometry = state.odometry.copy()
                 robot_is_ready = state.is_ready.copy()
+            episode_buffer.append_sample(state)
 
-        robot.start_state_update(on_robot_state, 1.0 / Settings.leader_arm_loop_period)
+        robot.start_state_update(on_robot_state, args.rate)
         deadline = time.monotonic() + 3.0
         while robot_is_ready is None and time.monotonic() < deadline:
             time.sleep(0.01)
         if robot_is_ready is None:
             raise RuntimeError("Timed out waiting for robot state updates")
 
-        # 3. Initialize Gripper
-        logging.info("Initializing Gripper hardware...")
-        gripper = Gripper()
-        if not gripper.initialize():
-            raise RuntimeError("Failed to initialize gripper")
-        gripper.homing()
-        gripper.start()
-
-        # 4. Initialize LeaderArm
+        # 5. Initialize LeaderArm hardware
         logging.info("Initializing LeaderArm hardware...")
         leader_arm = LeaderArm(control_period=Settings.leader_arm_loop_period)
         leader_arm.initialize(verbose=args.verbose)
+        if len(leader_arm.active_ids) != leader_arm.DEVICE_COUNT:
+            raise RuntimeError(
+                f"Leader-arm device count mismatch: expected {leader_arm.DEVICE_COUNT}, got {len(leader_arm.active_ids)}"
+            )
 
-        # 5. Stationary table manipulation mode (mobile base excluded)
-        logging.info("Stationary table manipulation mode (mobile base disabled).")
+        # Apply robust holding torque limits and stiff PID gains on LeaderArm
+        base_ma_torques = np.array([4.5, 4.5, 4.5, 3.5, 2.0, 2.0, 2.0] * 2, dtype=np.float64)
+        leader_arm.MAXIMUM_TORQUE = base_ma_torques.copy()
+        for dev_id in range(NUM_LEADER_MOTORS):
+            leader_arm.bus.set_position_pid_gain(dev_id, p_gain=HOMING_PID_P, i_gain=HOMING_PID_I, d_gain=HOMING_PID_D)
+
         teleop_publisher = TeleopStatePublisher()
-        recorder = EpisodeTrajectoryRecorder(model)
 
-        ma_q_limit_barrier = 0.5
+        # LeaderArm joint limits and dynamic barriers
+        ma_q_limit_barrier = args.ma_q_limit_barrier
         ma_min_q = np.deg2rad([-360, -30, 0, -135, -90, 35, -360, -360, 10, -90, -135, -90, 35, -360])
         ma_max_q = np.deg2rad([360, -10, 90, -60, 90, 80, 360, 360, 30, 0, -60, 90, 80, 360])
-        ma_torque_limit = np.array([3.5, 3.5, 3.5, 1.5, 1.5, 1.5, 1.5] * 2)
-        ma_viscous_gain = np.array([0.02, 0.02, 0.02, 0.02, 0.01, 0.01, 0.002] * 2)
+        ma_min_q[2] = -np.pi / 2
+        ma_max_q[2] = np.pi / 2
+        ma_min_q[9] = -np.pi / 2
+        ma_max_q[9] = np.pi / 2
+        ma_torque_limit = base_ma_torques.copy()
+        homing_torque_limits = base_ma_torques.copy() * args.autohome_current
+        ma_viscous_gain = 0.05
+        left_arm_2_offset_rad = float(np.deg2rad(args.left_arm_2_offset_deg))
 
-        # LeaderArm Modes: "HOLD" (calm stationary hold during reset), "HOMING" (100 Hz S-curve), "TELEOP"
-        leader_mode = "HOLD"
-        leader_hold_q: Optional[np.ndarray] = None
-        homing_start_q: Optional[np.ndarray] = None
-        homing_target_q: Optional[np.ndarray] = None
-        homing_start_time = 0.0
-        homing_done_event = threading.Event()
-        homing_torque_limits = np.array([3.5, 3.5, 3.5, 1.5, 1.5, 1.5, 1.5] * 2, dtype=np.float64)
+        # Check mobility wheel servos
+        with state_lock:
+            mobility_ready = robot_is_ready[model.mobility_idx].copy()
+        mobility_names = [model.robot_joint_names[i] for i in model.mobility_idx]
+        logging.info("Mobility joints: %s, ready=%s", mobility_names, mobility_ready.tolist())
 
-        def s_curve_quintic(t: float, total_time: float) -> float:
-            if total_time <= 0.0:
-                return 1.0
-            tau = np.clip(t / total_time, 0.0, 1.0)
-            return float(10.0 * (tau**3) - 15.0 * (tau**4) + 6.0 * (tau**5))
+        mobility_stream = robot.create_command_stream(priority=args.mobility_priority)
 
+        # LeaderArm Control Loop
         def leader_arm_control_loop(state):
             nonlocal right_q, left_q, right_minimum_time, left_minimum_time
-            nonlocal last_collision_log_time
-            nonlocal leader_hold_q
+            nonlocal last_collision_log_time, last_sent_base_command, last_mobile_send_time
+            nonlocal leader_mode, leader_hold_q, homing_start_q, homing_target_q, homing_start_time
 
             if stop_event.is_set():
                 return None
 
-            # Mode 1: HOLD - Rock-solid steady hold (prevents jitter/shaking during reset)
+            # Mode 1: HOLD - Steady hold (prevents droop during reset)
             if leader_mode == "HOLD":
                 if leader_hold_q is None:
                     leader_hold_q = state.q_joint.copy()
                 ma_input = LeaderArm.ControlInput()
                 ma_input.target_operating_mode.fill(rby.DynamixelBus.CurrentBasedPositionControlMode)
-                ma_input.target_torque.fill(2.0)
-                ma_input.target_position = leader_hold_q
+                ma_input.target_torque = ma_torque_limit.copy()
+                ma_input.target_position = leader_hold_q.copy()
                 return ma_input
 
-            # Mode 2: HOMING - Smooth 100 Hz S-curve auto-homing in the control thread (zero bus collisions)
+            # Mode 2: HOMING - Smooth 100 Hz S-curve auto-homing
             if leader_mode == "HOMING":
                 elapsed = time.monotonic() - homing_start_time
                 s = s_curve_quintic(elapsed, args.autohome_time)
@@ -622,25 +606,43 @@ def main() -> int:
 
                 ma_input = LeaderArm.ControlInput()
                 ma_input.target_operating_mode.fill(rby.DynamixelBus.CurrentBasedPositionControlMode)
-                ma_input.target_torque = homing_torque_limits
-                ma_input.target_position = q_des
+                ma_input.target_torque = homing_torque_limits.copy()
+                ma_input.target_position = q_des.copy()
 
                 if elapsed >= args.autohome_time:
                     err = np.max(np.abs(state.q_joint - homing_target_q))
-                    if err < args.autohome_tolerance or elapsed >= args.autohome_time + 0.5:
+                    if err < args.autohome_tolerance or elapsed >= args.autohome_time + 1.5:
                         homing_done_event.set()
                 return ma_input
 
             # Mode 3: TELEOP - Normal leader arm teleoperation
-
             if right_q is None:
                 right_q = state.q_joint[0:7].copy()
             if left_q is None:
                 left_q = state.q_joint[7:14].copy()
 
-            gripper_command = np.array([state.button_right.trigger, state.button_left.trigger], dtype=np.float64) / 1000.0
-            gripper.set_target(gripper_command)
+            # Gripper control
+            # LeaderArm trigger ADC: 0=released (open, 0.0), 1000=squeezed (closed, 1.0)
+            raw_triggers = np.array(
+                [state.button_right.trigger, state.button_left.trigger],
+                dtype=np.float64,
+            ) / 1000.0
+            if args.invert_gripper:
+                gripper_command = np.clip(1.0 - raw_triggers, 0.0, 1.0)
+            else:
+                gripper_command = np.clip(raw_triggers, 0.0, 1.0)
 
+            try:
+                gripper_cmd_client.set_targets(
+                    right_target=gripper_command[0],
+                    left_target=gripper_command[1],
+                    min_delta=0.005,
+                    force_heartbeat_s=0.1,
+                )
+            except Exception as exc:
+                logging.warning("Failed to send gripper command to daemon: %s", exc)
+
+            # LeaderArm joint torque & gravity compensation
             ma_input = LeaderArm.ControlInput()
             torque = (
                 state.gravity_term
@@ -649,6 +651,7 @@ def main() -> int:
             )
             torque = np.clip(torque, -ma_torque_limit, ma_torque_limit)
 
+            # Right arm trigger button
             if state.button_right.button == 1:
                 ma_input.target_operating_mode[0:7].fill(rby.DynamixelBus.CurrentControlMode)
                 ma_input.target_torque[0:7] = torque[0:7] * 0.6
@@ -658,6 +661,7 @@ def main() -> int:
                 ma_input.target_torque[0:7] = ma_torque_limit[0:7]
                 ma_input.target_position[0:7] = right_q
 
+            # Left arm trigger button
             if state.button_left.button == 1:
                 ma_input.target_operating_mode[7:14].fill(rby.DynamixelBus.CurrentControlMode)
                 ma_input.target_torque[7:14] = torque[7:14] * 0.6
@@ -667,22 +671,60 @@ def main() -> int:
                 ma_input.target_torque[7:14] = ma_torque_limit[7:14]
                 ma_input.target_position[7:14] = left_q
 
+            # Mobile base command from TTY controller
+            base_command = terminal_controller.get_command()
+            now = time.monotonic()
+            has_mobility_command = np.any(np.abs(base_command) > 1e-4)
+            if has_mobility_command or np.any(np.abs(last_sent_base_command) > 1e-4):
+                if has_mobility_command or (now - last_mobile_send_time >= args.mobile_refresh_time):
+                    try:
+                        cmd = (
+                            rby.OptimalControlMobileBaseCommandBuilder()
+                            .set_command_header(
+                                rby.CommandHeaderBuilder()
+                                .set_control_hold_time(args.mobile_hold_time)
+                            )
+                            .set_velocity_limit(
+                                [args.linear_speed, args.linear_speed, args.angular_speed]
+                            )
+                            .set_acceleration_limit(
+                                [
+                                    args.linear_acceleration,
+                                    args.linear_acceleration,
+                                    args.angular_acceleration,
+                                ]
+                            )
+                            .set_target_velocity(base_command)
+                            .set_minimum_time(args.mobile_ramp_time)
+                        )
+                        mobility_stream.send_command(
+                            rby.RobotCommandBuilder().set_command(
+                                rby.ComponentBasedCommandBuilder().set_mobility_command(cmd)
+                            )
+                        )
+                        last_sent_base_command = base_command.copy()
+                        last_mobile_send_time = now
+                    except Exception as exc:
+                        logging.warning("Mobility stream send error: %s", exc)
+
             with state_lock:
                 if robot_position is None:
                     return ma_input
                 q = robot_position.copy()
-                q_dot = robot_velocity.copy() if robot_velocity is not None else None
-                odometry = robot_odometry.copy()
+
+            # Self-collision detection
+            left_q_adjusted = left_q.copy()
+            if abs(left_arm_2_offset_rad) > 1e-6:
+                left_q_adjusted[2] += left_arm_2_offset_rad
 
             q_for_collision = q.copy()
             q_for_collision[model.right_arm_idx] = right_q
-            q_for_collision[model.left_arm_idx] = left_q
+            q_for_collision[model.left_arm_idx] = left_q_adjusted
             dyn_state.set_q(q_for_collision)
             dyn_model.compute_forward_kinematics(dyn_state)
             nearest = dyn_model.detect_collisions_or_nearest_links(dyn_state, 1)[0]
             is_collision = nearest.distance < args.collision_distance
             if is_collision and (state.button_right.button or state.button_left.button):
-                now = time.monotonic()
                 if now - last_collision_log_time >= 1.0:
                     logging.warning("Arm motion blocked by self-collision limit (%.4fm)", nearest.distance)
                     last_collision_log_time = now
@@ -710,7 +752,7 @@ def main() -> int:
                 left_builder = rby.JointPositionCommandBuilder() if position_mode else rby.JointImpedanceControlCommandBuilder()
                 (
                     left_builder.set_command_header(rby.CommandHeaderBuilder().set_control_hold_time(1e6))
-                    .set_position(np.clip(left_q, robot_min_q[model.left_arm_idx], robot_max_q[model.left_arm_idx]))
+                    .set_position(np.clip(left_q_adjusted, robot_min_q[model.left_arm_idx], robot_max_q[model.left_arm_idx]))
                     .set_velocity_limit(robot_max_qdot[model.left_arm_idx])
                     .set_acceleration_limit(robot_max_qddot[model.left_arm_idx] * 30)
                     .set_minimum_time(left_minimum_time)
@@ -720,8 +762,9 @@ def main() -> int:
             else:
                 left_minimum_time = 0.8
 
-            base_command = np.zeros(3, dtype=np.float64)
+            # Publish to SHM for external monitors and EpisodeBuffer
             teleop_publisher.publish(gripper_command, base_command, state.q_joint)
+
             if has_body_command and arm_stream is not None:
                 try:
                     arm_stream.send_command(
@@ -730,10 +773,8 @@ def main() -> int:
                         )
                     )
                 except Exception as exc:
-                    logging.warning("Arm stream send error (stream may need recreate): %s", exc)
+                    logging.warning("Arm stream send error: %s", exc)
 
-            # Record synchronized step if recording is active
-            recorder.append(q, q_dot, odometry, base_command, gripper_command, state.q_joint)
             return ma_input
 
         def safety_function(state):
@@ -743,39 +784,43 @@ def main() -> int:
         if not leader_arm.start_control(leader_arm_control_loop, safety_function=safety_function):
             raise RuntimeError("Failed to start leader-arm control")
 
-        # Start unified terminal controller (handles arrow keys & action keys)
         terminal_controller.start()
 
-        # FSM Helper: Prepare Episode (Reset -> In-loop S-Curve Auto-home -> Standby)
+        # FSM Helper: Prepare Episode (Reset via venv subprocess -> LeaderArm Auto-home -> Teleop ready)
         def prepare_episode(ep_idx: int) -> bool:
             nonlocal leader_mode, leader_hold_q, homing_start_q, homing_target_q, homing_start_time
             nonlocal arm_stream, right_q, left_q
 
-            # 1. Switch LeaderArm to calm HOLD mode (freezes current angle so it does NOT vibrate)
-            leader_hold_q = None  # Will latch current joint angles on next tick
+            # 1. Put LeaderArm in HOLD mode so it does not fall or move
+            leader_hold_q = None
             leader_mode = "HOLD"
 
-            # Release active arm stream before subprocess takes control
+            # 2. Release arm command stream completely so robot control is 100% free
             if arm_stream is not None:
                 try:
                     arm_stream.cancel()
                 except Exception:
                     pass
                 arm_stream = None
+            time.sleep(0.2)
 
+            # 3. Execute sample_and_move_to_ready.py via isolated venv subprocess
             print(f"\n[Episode #{ep_idx:04d}] >>> Step 1: Moving robot to perturbed initial pose...")
             if not execute_auto_reset(args):
-                print(f"[!] Auto-reset failed for Episode #{ep_idx:04d}. Press 'c' to retry or 'q' to quit.")
+                print(f"[!] Auto-reset failed for Episode #{ep_idx:04d}. Press 'r' to retry or 'q' to quit.")
                 return False
 
-            # 2. Read live robot arm angles
+            # 4. Read new robot arm angles
             with state_lock:
                 curr_right = robot_position[model.right_arm_idx].copy()
                 curr_left = robot_position[model.left_arm_idx].copy()
                 curr_torso = robot_position[model.torso_idx].copy()
-            target_leader = np.concatenate([curr_right, curr_left])
 
-            # 3. Smooth in-loop S-Curve auto-homing without serial port conflict
+            target_leader = np.concatenate([curr_right, curr_left])
+            if abs(left_arm_2_offset_rad) > 1e-6:
+                target_leader[9] -= left_arm_2_offset_rad
+
+            # 5. Smooth in-loop S-Curve auto-homing without serial port conflict
             print(f"[Episode #{ep_idx:04d}] >>> Step 2: Auto-Homing LeaderArm to robot pose (duration={args.autohome_time:.1f}s)...")
             homing_done_event.clear()
             homing_start_q = leader_hold_q.copy() if leader_hold_q is not None else target_leader.copy()
@@ -783,13 +828,13 @@ def main() -> int:
             homing_start_time = time.monotonic()
             leader_mode = "HOMING"
 
-            if not homing_done_event.wait(timeout=args.autohome_time + 2.0):
+            if not homing_done_event.wait(timeout=args.autohome_time + 2.5):
                 logging.warning("LeaderArm auto-homing timeout reached; proceeding to teleop.")
 
             right_q = target_leader[0:7].copy()
             left_q = target_leader[7:14].copy()
 
-            # 4. Reconnect arm stream with hold command
+            # 6. Reconnect arm stream with initial hold command
             try:
                 arm_stream = robot.create_command_stream(priority=args.priority)
                 curr_pose = leader_example.Pose(
@@ -803,23 +848,48 @@ def main() -> int:
             except Exception as exc:
                 logging.error("Failed to re-create arm command stream: %s", exc)
 
+            leader_hold_q = target_leader.copy()
             leader_mode = "TELEOP"
-            print(f"\n>>> [Episode #{ep_idx:04d}] 로봇 준비 완료 (Teleop ACTIVE).")
-            print("    [s] : 데이터 기록 시작 (START)")
-            print("    [c] : 다시 리셋 (Re-reset)")
-            print("    [q] : 종료 (Quit)")
+            release_gripper_fully(gripper_cmd_client, invert=args.invert_gripper)
+
+            print("\n" + "=" * 65)
+            print(f" >>> [READY] Episode #{ep_idx:04d} Ready! Robot at Ready Pose & LeaderArm Synchronized.")
+            print("     [s] : Start Recording Episode")
+            print("     [r] : Re-sample & Reset to New Ready Pose")
+            print("     [q] : Quit Session")
+            print("=" * 65 + "\n")
             return True
 
-        # Run initial episode preparation
+        # Run initial episode preparation (unless --skip-initial-reset is passed)
         fsm_state = "PREPARING"
-        if prepare_episode(current_episode_idx):
+        if not args.skip_initial_reset:
+            if prepare_episode(current_episode_idx):
+                fsm_state = "STANDBY"
+            else:
+                fsm_state = "ERROR"
+        else:
+            leader_mode = "TELEOP"
             fsm_state = "STANDBY"
+            print("\n>>> Skipped initial reset as requested. Standby for [s] or [r].\n")
+
+        current_npz_output: Optional[Path] = None
+        current_camera_output: Optional[Path] = None
+        last_hud_time = 0.0
 
         # Main Interactive Event Loop
         while not stop_event.is_set():
-            # Check camera session health
+            now = time.monotonic()
+            # Check camera session health while recording
             if camera_session is not None and fsm_state == "RECORDING":
                 camera_session.check_health()
+
+            # Periodic HUD status display (every 1.0s)
+            if now - last_hud_time >= 1.0:
+                last_hud_time = now
+                if fsm_state == "RECORDING":
+                    dur = episode_buffer.elapsed_time()
+                    cnt = episode_buffer.sample_count()
+                    print(f"\r  [● REC #{current_episode_idx:04d} [Cam: 30Hz]] Duration: {dur:5.1f}s | Samples: {cnt:5d}  (Press 'e' to save, 'x' to discard)", end="", flush=True)
 
             # Process keyboard events
             try:
@@ -833,11 +903,8 @@ def main() -> int:
                 break
 
             elif char == "s":
-                if fsm_state == "RECORDING":
-                    print(f"\n[!] Already recording Episode #{current_episode_idx:04d}!")
-                    continue
-                if fsm_state != "STANDBY":
-                    print(f"\n[!] Cannot start recording in state {fsm_state}. Press 'c' to reset first.")
+                if fsm_state not in ("STANDBY", "STOPPED"):
+                    print(f"\n[!] Cannot start recording in state {fsm_state}. Press 'r' to reset first.")
                     continue
 
                 current_npz_output = args.output_dir / f"{args.prefix}_{current_episode_idx:04d}.npz"
@@ -849,6 +916,7 @@ def main() -> int:
                             camera_stack_root=args.camera_stack_root,
                             output=current_camera_output,
                             camera_hz=args.camera_hz,
+                            collection_profile=args.collection_profile,
                             zed_shm_mode=args.zed_shm_mode,
                             zed_record_profile=args.zed_record_profile,
                             max_frame_age_s=args.camera_max_frame_age_s,
@@ -868,13 +936,13 @@ def main() -> int:
                         logging.error("Failed to start camera session: %s", exc)
                         camera_session = None
 
-                recorder.start()
+                episode_buffer.start()
                 fsm_state = "RECORDING"
-                print("\n" + "=" * 60)
-                print(f" >>> [RECORDING] Episode #{current_episode_idx:04d} STARTED!")
-                print("     파지를 수행하세요. 파지 완료 후 [e]를 누르세요.")
-                print("     취소는 [d] (Discard)")
-                print("=" * 60)
+                print("\n" + "=" * 65)
+                print(f" >>> [● RECORDING START] Episode #{current_episode_idx:04d} STARTED!")
+                print("     리더암으로 파지를 수행하세요. 파지 완료 후 [e]를 누르면 저장됩니다.")
+                print("     (취소는 [x])")
+                print("=" * 65)
 
             elif char == "e":
                 if fsm_state != "RECORDING":
@@ -890,24 +958,25 @@ def main() -> int:
                     camera_session = None
 
                 # Save kinematics NPZ
-                count = recorder.stop_and_save(current_npz_output)
+                count = episode_buffer.stop_and_save(current_npz_output)
                 fsm_state = "STOPPED"
 
                 # Auto-release gripper
-                release_gripper_fully(gripper)
+                release_gripper_fully(gripper_cmd_client, invert=args.invert_gripper)
 
-                print("\n" + "=" * 60)
-                print(f" >>> [STOPPED] Episode #{current_episode_idx:04d} 저장 완료 (총 {count} samples).")
-                print("     그리퍼를 열었습니다.")
-                print("     [c] : 다음 에피소드로 이동 (Auto-reset)")
-                print("     [d] : 방금 에피소드 삭제 (Discard)")
+                print("\n" + "=" * 65)
+                print(f" >>> [✔ SAVED] Episode #{current_episode_idx:04d} 저장 완료 (총 {count} samples).")
+                print("     그리퍼를 자동으로 열었습니다.")
+                print("     [r] : 다음 에피소드로 이동 (새 Random Ready Pose 이동 & Auto-home)")
+                print("     [s] : 현재 위치에서 바로 다음 녹화 시작")
+                print("     [x] : 방금 에피소드 삭제 (Discard)")
                 print("     [q] : 전체 세션 종료 (Quit)")
-                print("=" * 60)
+                print("=" * 65)
 
-            elif char == "d":
+            elif char == "x":
                 if fsm_state == "RECORDING":
                     print(f"\n>>> [DISCARD] Cancelling recording of Episode #{current_episode_idx:04d}...")
-                    recorder.discard()
+                    episode_buffer.discard()
                     if camera_session is not None:
                         try:
                             camera_session.stop()
@@ -919,9 +988,9 @@ def main() -> int:
                             current_camera_output.unlink()
                         except Exception:
                             pass
-                    release_gripper_fully(gripper)
+                    release_gripper_fully(gripper_cmd_client, invert=args.invert_gripper)
                     fsm_state = "STANDBY"
-                    print(">>> 에피소드가 취소되었습니다. 다시 파지하려면 [s], 리셋하려면 [c]를 누르세요.")
+                    print(">>> 에피소드가 취소되었습니다. 다시 파지하려면 [s], 리셋하려면 [r]을 누르세요.")
 
                 elif fsm_state == "STOPPED":
                     print(f"\n>>> [DISCARD] Deleting saved files for Episode #{current_episode_idx:04d}...")
@@ -929,9 +998,9 @@ def main() -> int:
                         current_npz_output.unlink(missing_ok=True)
                     if current_camera_output and current_camera_output.exists():
                         current_camera_output.unlink(missing_ok=True)
-                    print(f">>> Episode #{current_episode_idx:04d} 파일이 삭제되었습니다. [c]를 눌러 다시 진행하세요.")
+                    print(f">>> Episode #{current_episode_idx:04d} 파일이 삭제되었습니다. [r]을 눌러 다시 진행하세요.")
 
-            elif char == "c":
+            elif char == "r":
                 if fsm_state == "RECORDING":
                     print("\n[!] Episode is currently recording. Press 'e' to stop first.")
                     continue
@@ -942,6 +1011,8 @@ def main() -> int:
                 fsm_state = "PREPARING"
                 if prepare_episode(current_episode_idx):
                     fsm_state = "STANDBY"
+                else:
+                    fsm_state = "ERROR"
 
     except Exception:
         logging.exception("Interactive record session failed")
@@ -949,43 +1020,75 @@ def main() -> int:
         logging.info("Shutting down interactive session...")
         stop_event.set()
 
+        # 1. Gracefully ramp down LeaderArm torques first (prevents sudden jerk or snapping on exit)
+        if leader_arm is not None:
+            try:
+                logging.info("Gently ramping down LeaderArm motor torques (1.2 s)...")
+                leader_arm.stop_control(torque_disable=False)
+                motor_ids = list(range(NUM_LEADER_MOTORS))
+                # Lock present joint positions as targets to prevent snapping back to an older pose
+                try:
+                    q_curr = read_joint_positions(leader_arm.bus, motor_ids)
+                    leader_arm.bus.group_sync_write_send_position(
+                        [(i, float(q_curr[i])) for i in motor_ids]
+                    )
+                except Exception as q_exc:
+                    logging.debug("Could not lock current pose before ramp down: %s", q_exc)
+
+                steps = 24
+                default_torque_limits = np.array([4.5, 4.5, 4.5, 3.5, 2.0, 2.0, 2.0] * 2, dtype=np.float64)
+                for alpha in np.linspace(1.0, 0.0, steps):
+                    leader_arm.bus.group_sync_write_send_torque(
+                        [(i, float(default_torque_limits[i] * alpha)) for i in motor_ids]
+                    )
+                    time.sleep(1.2 / steps)
+                leader_arm.DisableTorque()
+                logging.info("LeaderArm torques safely released.")
+            except Exception as exc:
+                logging.warning("Leader-arm cleanup failed: %s", exc)
+                try:
+                    leader_arm.DisableTorque()
+                except Exception:
+                    pass
+
+        # 2. Stop terminal controller
         try:
             terminal_controller.stop()
         except Exception:
             pass
 
+        # 3. Stop camera session
         if camera_session is not None:
             try:
                 camera_session.stop()
             except Exception:
                 pass
 
+        # 4. Stop gripper sampler
+        if gripper_sampler is not None:
+            try:
+                gripper_sampler.stop()
+            except Exception:
+                pass
 
+        # 5. Cleanly cancel robot command streams
         if arm_stream is not None:
             try:
                 arm_stream.cancel()
             except Exception:
                 pass
 
-        # Graceful torque ramp-down
-        if leader_arm is not None:
+        if mobility_stream is not None:
             try:
-                logging.info("Gently ramping down LeaderArm torques (1.2s)...")
-                leader_arm.stop_control(torque_disable=False)
-                motor_ids = list(range(14))
-                steps = 24
-                torques = np.array([3.5, 3.5, 3.5, 2.5, 1.5, 1.5, 1.5] * 2, dtype=np.float64)
-                for a in np.linspace(1.0, 0.0, steps):
-                    leader_arm.bus.group_sync_write_send_torque([(i, torques[i] * a) for i in motor_ids])
-                    time.sleep(1.2 / steps)
-                leader_arm.DisableTorque()
-                logging.info("LeaderArm torques safely released.")
+                mobility_stream.cancel()
             except Exception:
                 pass
 
-        if gripper is not None:
+        # 6. Ensure gripper is left in open position
+        if gripper_cmd_client is not None:
             try:
-                gripper.stop()
+                open_target = 1.0 if args.invert_gripper else 0.0
+                gripper_cmd_client.set_targets(open_target, open_target)
             except Exception:
                 pass
 
