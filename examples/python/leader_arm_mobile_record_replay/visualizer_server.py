@@ -37,19 +37,20 @@ MODELS_DIR = ROOT_DIR / "models"
 
 def get_episode_list(recordings_dir: Path) -> list[dict]:
     """Scan recordings directory and return sorted list of episode metadata."""
-    candidate_dirs = [recordings_dir, Path("/home/nvidia/recordings"), Path("/mnt/ssd/rby1-sdk/recordings")]
+    candidate_dirs = [recordings_dir, Path("/mnt/ssd/rby1_data"), Path("/home/nvidia/recordings"), Path("/mnt/ssd/rby1-sdk/recordings")]
     seen_ids = set()
     episodes = []
 
     for r_dir in candidate_dirs:
         if not r_dir.exists():
             continue
-        npz_files = sorted(r_dir.glob("*.npz"), reverse=True)
+        npz_files = sorted(r_dir.rglob("*.npz"), reverse=True)
         for npz_path in npz_files:
-            stem = npz_path.stem
-            if stem in seen_ids:
+            parent_name = npz_path.parent.name
+            ep_id = f"{parent_name}__{npz_path.stem}" if parent_name != "recordings" else npz_path.stem
+            if ep_id in seen_ids:
                 continue
-            seen_ids.add(stem)
+            seen_ids.add(ep_id)
 
             cam_h5 = npz_path.with_suffix(".cameras.h5")
             has_cameras = cam_h5.exists()
@@ -79,9 +80,10 @@ def get_episode_list(recordings_dir: Path) -> list[dict]:
 
                 cam_fps = round(cam_frames / duration_s, 1) if (has_cameras and duration_s > 0 and cam_frames > 0) else 0.0
 
+                disp_name = f"[{parent_name}] {npz_path.name}" if parent_name != "recordings" else npz_path.name
                 episodes.append({
-                    "id": stem,
-                    "name": npz_path.name,
+                    "id": ep_id,
+                    "name": disp_name,
                     "filename": npz_path.name,
                     "has_cameras": has_cameras,
                     "sample_count": sample_count,
@@ -1128,16 +1130,19 @@ HTML_TEMPLATE = """<!DOCTYPE html>
                     }
                 }
 
-                // Animate Gripper Finger Prismatic Joints in 3D (0.0=Open, 1.0=Closed)
+                // Animate Gripper Finger Prismatic Joints in 3D (0.0=Closed, 1.0=Open)
                 const gripper = (episodeData.gripper_command && episodeData.gripper_command[idx]) ? episodeData.gripper_command[idx] : [0, 0];
                 const rGrip = (typeof gripper[0] === 'number') ? Math.min(1.0, Math.max(0.0, gripper[0])) : 0.0;
                 const lGrip = (typeof gripper[1] === 'number') ? Math.min(1.0, Math.max(0.0, gripper[1])) : 0.0;
+                // Standard convention: 0.0=Closed (fingers at -0.045), 1.0=Open (fingers at 0.0)
+                const rClose = 1.0 - rGrip;
+                const lClose = 1.0 - lGrip;
 
                 if (robotModel.joints) {
-                    if (robotModel.joints['gripper_finger_r1']) robotModel.setJointValue('gripper_finger_r1', -0.045 * rGrip);
-                    if (robotModel.joints['gripper_finger_r2']) robotModel.setJointValue('gripper_finger_r2', 0.045 * rGrip);
-                    if (robotModel.joints['gripper_finger_l1']) robotModel.setJointValue('gripper_finger_l1', -0.045 * lGrip);
-                    if (robotModel.joints['gripper_finger_l2']) robotModel.setJointValue('gripper_finger_l2', 0.045 * lGrip);
+                    if (robotModel.joints['gripper_finger_r1']) robotModel.setJointValue('gripper_finger_r1', -0.045 * rClose);
+                    if (robotModel.joints['gripper_finger_r2']) robotModel.setJointValue('gripper_finger_r2', 0.045 * rClose);
+                    if (robotModel.joints['gripper_finger_l1']) robotModel.setJointValue('gripper_finger_l1', -0.045 * lClose);
+                    if (robotModel.joints['gripper_finger_l2']) robotModel.setJointValue('gripper_finger_l2', 0.045 * lClose);
                 }
             }
 
@@ -1336,14 +1341,28 @@ class VisualizerRequestHandler(BaseHTTPRequestHandler):
             pass
 
     def _resolve_episode_files(self, episode_id: str) -> tuple[Optional[Path], Optional[Path]]:
-        candidate_dirs = [self.recordings_dir, Path("/home/nvidia/recordings"), Path("/mnt/ssd/rby1-sdk/recordings")]
+        candidate_dirs = [self.recordings_dir, Path("/mnt/ssd/rby1_data"), Path("/home/nvidia/recordings"), Path("/mnt/ssd/rby1-sdk/recordings")]
         for r_dir in candidate_dirs:
             if not r_dir.exists():
                 continue
+            if "__" in episode_id:
+                parent_name, stem = episode_id.split("__", 1)
+                if r_dir.name == parent_name:
+                    npz = r_dir / f"{stem}.npz"
+                    if npz.exists():
+                        cam = npz.with_suffix(".cameras.h5")
+                        return npz, cam if cam.exists() else None
+                npz = r_dir / parent_name / f"{stem}.npz"
+                if npz.exists():
+                    cam = npz.with_suffix(".cameras.h5")
+                    return npz, cam if cam.exists() else None
             npz = r_dir / f"{episode_id}.npz"
             if npz.exists():
-                cam = r_dir / f"{episode_id}.cameras.h5"
-                return npz, cam
+                cam = npz.with_suffix(".cameras.h5")
+                return npz, cam if cam.exists() else None
+            for sub_npz in r_dir.rglob(f"{episode_id}.npz"):
+                cam = sub_npz.with_suffix(".cameras.h5")
+                return sub_npz, cam if cam.exists() else None
         return None, None
 
     def do_GET(self):
